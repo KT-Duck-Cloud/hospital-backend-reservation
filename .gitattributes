@@ -1,0 +1,12 @@
+# 줄바꿈 규칙. 저장소에는 항상 LF 로 저장한다.
+# 기본: 텍스트 파일은 작업 폴더에서도 LF (컨테이너·리눅스에서 실행되는 .sh·.py·.yaml 등이 깨지지 않도록)
+* text=auto eol=lf
+
+# PowerShell 스크립트만 작업 폴더에서 CRLF (Windows PowerShell 5.1 용)
+*.ps1 text eol=crlf
+
+# 바이너리
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary

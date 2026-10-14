@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>병원 예약</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: "Malgun Gothic", system-ui, sans-serif; background: #f4f6f8; color: #222; margin: 0; padding: 0 16px 40px; }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 20px 0 12px; }
+  h2 { font-size: 1.05rem; margin: 0 0 12px; }
+  section { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  #message { min-height: 40px; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: .95rem; visibility: hidden; }
+  #message.show { visibility: visible; }
+  #message.ok { background: #e6f4ea; color: #1e6b34; }
+  #message.err { background: #fdecea; color: #b3261e; }
+  form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  label { display: flex; flex-direction: column; font-size: .85rem; gap: 4px; color: #555; }
+  input { padding: 8px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: .95rem; }
+  button { padding: 8px 14px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; font-size: .9rem; cursor: pointer; }
+  button:hover { background: #1d4fd0; }
+  button.sub { background: #e5e9ee; color: #333; }
+  button.sub:hover { background: #d6dce3; }
+  button.danger { background: #dc2626; }
+  button.danger:hover { background: #b91c1c; }
+  .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .head h2 { margin: 0; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e8ecf0; white-space: nowrap; }
+  th { color: #666; font-weight: 600; }
+  td.actions { display: flex; gap: 6px; }
+  .empty { color: #888; text-align: center; padding: 16px; }
+  footer { text-align: center; font-size: .75rem; color: #888; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>병원 예약</h1>
+
+  <div id="message" role="status"></div>
+
+  <section>
+    <h2>예약 만들기</h2>
+    <form id="create-form">
+      <label>환자 번호
+        <input id="patient" type="text" maxlength="32" required placeholder="예: P001">
+      </label>
+      <label>진료 시간
+        <input id="time" type="datetime-local" required>
+      </label>
+      <button type="submit">예약</button>
+    </form>
+  </section>
+
+  <section>
+    <div class="head">
+      <h2>예약 목록</h2>
+      <button type="button" class="sub" id="refresh">새로고침</button>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>번호</th><th>환자</th><th>진료 시간</th><th>예약 상태</th><th>접수 상태</th><th></th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer id="version">버전 확인 중…</footer>
+</main>
+
+<script>
+const STATUS_LABEL = { BOOKED: "예약됨", CANCELED: "취소됨" };
+const CHECKIN_LABEL = { WAITING: "접수 전", CHECKED_IN: "접수 완료" };
+
+const $ = (id) => document.getElementById(id);
+let messageTimer;
+
+function showMessage(text, ok) {
+  const el = $("message");
+  el.textContent = text;
+  el.className = "show " + (ok ? "ok" : "err");
+  clearTimeout(messageTimer);
+  messageTimer = setTimeout(() => { el.className = ""; }, 5000);
+}
+
+// 서버 오류 응답에서 사람이 읽을 문장을 뽑는다. (422는 detail이 배열)
+async function errorText(res) {
+  let detail = "";
+  try {
+    const data = await res.json();
+    if (typeof data.detail === "string") detail = data.detail;
+    else if (Array.isArray(data.detail)) detail = data.detail.map((d) => d.msg).join(", ");
+  } catch (e) {}
+  return `실패 (${res.status})` + (detail ? `: ${detail}` : "");
+}
+
+// 요청 ID로 쓸 UUID. crypto.randomUUID()는 https/localhost에서만 있어서, 없으면 다른 방법으로 만든다.
+function newRequestId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(bytes);
+  else for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;  // 버전 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const h = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+function fmtTime(iso) {
+  return new Date(iso).toLocaleString("ko-KR");
+}
+
+async function loadList() {
+  try {
+    const res = await fetch("/api/v1/reservations");
+    if (!res.ok) { showMessage(await errorText(res), false); return; }
+    render(await res.json());
+  } catch (e) {
+    showMessage("서버에 연결할 수 없습니다.", false);
+  }
+}
+
+function render(items) {
+  const tbody = $("rows");
+  tbody.innerHTML = "";
+  if (items.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">예약이 없습니다.</td></tr>';
+    return;
+  }
+  for (const r of items) {
+    const tr = document.createElement("tr");
+    const cells = [r.id, r.patient_id, fmtTime(r.appointment_time),
+      STATUS_LABEL[r.status] || r.status, CHECKIN_LABEL[r.checkin_status] || r.checkin_status];
+    for (const c of cells) {
+      const td = document.createElement("td");
+      td.textContent = c;  // textContent라서 입력값이 HTML로 해석되지 않는다.
+      tr.appendChild(td);
+    }
+    const td = document.createElement("td");
+    td.className = "actions";
+    td.appendChild(actionButton("취소", "danger", r.id, "DELETE", "", "예약을 취소했습니다."));
+    td.appendChild(actionButton("접수", "", r.id, "POST", "/checkin", "접수했습니다."));
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+}
+
+function actionButton(label, cls, id, method, suffix, okText) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = label;
+  if (cls) b.className = cls;
+  b.addEventListener("click", () => act(id, method, suffix, okText));
+  return b;
+}
+
+async function act(id, method, suffix, okText) {
+  try {
+    const res = await fetch(`/api/v1/reservations/${id}${suffix}`, { method });
+    showMessage(res.ok ? `#${id} ${okText}` : `#${id} ${await errorText(res)}`, res.ok);
+  } catch (e) {
+    showMessage("서버에 연결할 수 없습니다.", false);
+  }
+  loadList();
+}
+
+$("create-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const local = $("time").value;            // "2026-10-05T10:00" (브라우저 현지 시각)
+  const date = new Date(local);
+  if (!local || isNaN(date)) { showMessage("진료 시간을 입력해 주세요.", false); return; }
+  const body = {
+    patient_id: $("patient").value,
+    appointment_time: date.toISOString(),    // UTC, 끝이 Z
+  };
+  const submit = $("create-form").querySelector("button[type=submit]");
+  submit.disabled = true;  // 진행 중에는 다시 누를 수 없게 해서 중복 예약을 막는다.
+  try {
+    const res = await fetch("/api/v1/reservations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Request-ID": newRequestId() },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) {
+      const r = await res.json();
+      showMessage(`예약 완료 (#${r.id})`, true);
+      $("patient").value = "";
+    } else {
+      showMessage(await errorText(res), false);
+    }
+  } catch (e) {
+    showMessage("서버에 연결할 수 없습니다.", false);
+  } finally {
+    submit.disabled = false;
+  }
+  loadList();
+});
+
+$("refresh").addEventListener("click", loadList);
+
+(async function loadVersion() {
+  try {
+    const res = await fetch("/healthz");
+    const data = await res.json();
+    $("version").textContent = `버전 ${data.version}`;
+  } catch (e) {
+    $("version").textContent = "버전 확인 실패";
+  }
+})();
+
+loadList();
+</script>
+</body>
+</html>

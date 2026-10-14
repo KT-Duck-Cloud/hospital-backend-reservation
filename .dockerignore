@@ -1,0 +1,57 @@
+# 비밀 정보
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
+**/*.jks
+**/id_rsa*
+**/id_ed25519*
+**/secrets/
+**/credentials*
+
+# 버전 관리 / 에디터 / 도구 설정
+.git
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+
+# 로컬 데이터 · 테스트 데이터
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.csv
+**/*.dump
+**/*.sql.gz
+tests/
+test/
+**/testdata/
+**/fixtures/
+**/.pytest_cache/
+**/.coverage
+htmlcov/
+
+# 파이썬 가상환경 / 캐시
+.venv/
+venv/
+**/__pycache__/
+**/*.pyc
+
+# 이미지 실행에 필요 없는 것들
+Dockerfile
+.dockerignore
+helm/
+db/
+docs/
+*.md
+prompt*.md
+**/*.tmp
+**/*.log
+
+# 서비스별 테스트 (services/<이름>/tests)
+**/tests/
+**/conftest.py
+reservation.db

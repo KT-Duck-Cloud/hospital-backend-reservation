@@ -1,0 +1,40 @@
+# 비밀 정보 (값은 .env 에만 둔다. .env.example 은 올린다)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# 파이썬
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 로컬 DB 파일
+*.db
+*.sqlite
+*.sqlite3
+
+# 노드 / 화면 빌드
+node_modules/
+dist/
+.vite/
+*.log
+
+# 이미지 묶음, 작업 메모
+*.tar.gz
+prompt-step*.md
+
+# 에디터 / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
