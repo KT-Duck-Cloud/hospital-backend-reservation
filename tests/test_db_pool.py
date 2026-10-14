@@ -16,12 +16,13 @@ PROBE = (
     "print(json.dumps({'size': p.size(), 'overflow': p._max_overflow, 'timeout': p._timeout, "
     "'recycle': p._recycle, 'pre_ping': p._pre_ping}))"
 )
-FAKE_URL = "mysql+pymysql://u:p@127.0.0.1:1/x"  # 만들기만 하고 접속하지 않는다
+FAKE_DB = {"DB_URL": "mysql://127.0.0.1:1/x", "DB_USERNAME": "u", "DB_PASSWORD": "p"}  # 만들기만 하고 접속하지 않는다
 
 
 def probe(**env):
     full = {k: v for k, v in os.environ.items() if not k.startswith("DB_POOL") and k != "DB_MAX_OVERFLOW"}
-    full.update(DATABASE_URL=FAKE_URL, **env)
+    full.pop("DATABASE_URL", None)
+    full.update(FAKE_DB, **env)
     r = subprocess.run([sys.executable, "-c", PROBE], cwd=ROOT, env=full, capture_output=True, text=True)
     return r
 

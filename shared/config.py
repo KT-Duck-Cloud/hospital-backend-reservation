@@ -1,11 +1,15 @@
 """환경변수를 읽어 오는 파일. 비밀 정보(DB 비밀번호 등)는 코드에 쓰지 않고 환경변수로만 받는다."""
 import os
 
-# 접속할 DB 주소. 환경변수로만 받는다. 기본값은 없다(비밀번호가 코드·이미지에 들어가면 안 되므로).
-# 형식: mysql+pymysql://사용자:비밀번호@호스트:3306/DB이름   (실제 값은 실행할 때 주입한다)
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-if not DATABASE_URL:
-    raise RuntimeError("환경변수 DATABASE_URL이 설정되지 않았습니다.")
+# 접속할 DB. 환경변수로만 받는다. 기본값은 없다(비밀번호가 코드·이미지에 들어가면 안 되므로).
+# - DB_URL: 계정 없는 주소. 예) mysql://호스트:3306/hospital   (테스트는 sqlite:///파일경로)
+# - DB_USERNAME, DB_PASSWORD: DB 계정 (auth·reservation 은 app_runtime, stats 는 app_readonly). 운영은 Secret 으로 넣는다.
+# 세 값을 합친 접속 정보는 shared/db.py 가 만든다. 비밀번호는 로그·오류 메시지·화면에 내지 않는다.
+DB_URL = os.environ.get("DB_URL", "").strip()
+if not DB_URL:
+    raise RuntimeError("환경변수 DB_URL이 설정되지 않았습니다.")
+DB_USERNAME = os.environ.get("DB_USERNAME", "").strip()
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 
 # DB TLS CA 인증서 파일 경로. 있으면 CA·서버 이름까지 검증하고, 없으면 암호화(TLS)만 한다 (로컬 compose 용).
 DB_SSL_CA = os.getenv("DB_SSL_CA", "").strip()

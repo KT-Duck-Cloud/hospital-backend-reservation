@@ -7,7 +7,7 @@
 
 필요한 값 (화면에 출력하지 않는다)
   - MEDICAL_KEY (base64 32바이트), MEDICAL_KEY_VERSION (기본 1): 환경변수, 없으면 저장소 루트 .env
-  - DB: 환경변수 DATABASE_URL, 없으면 .env 의 APP_RUNTIME_PASSWORD 로 127.0.0.1:3306 (app_runtime, TLS)
+  - DB: 환경변수 DB_URL·DB_USERNAME·DB_PASSWORD, 없으면 127.0.0.1:3306 · app_runtime · .env 의 APP_RUNTIME_PASSWORD (TLS)
   앱(예약 서비스)과 같은 MEDICAL_KEY 를 써야 R11 에서 복호화된다.
 
 실행 (PowerShell, 저장소 루트):  .venv\\Scripts\\python scripts\\seed_records.py
@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from seed_users import database_url, read_dotenv_value  # noqa: E402  (같은 .env·DB 연결 규칙)
+from seed_users import read_dotenv_value, set_db_env  # noqa: E402  (같은 .env·DB 연결 규칙)
 
 # 가상 진단·소견 (진료과 코드별)
 SAMPLES = {
@@ -141,7 +141,7 @@ def main() -> None:
             value = read_dotenv_value(name)
             if value:
                 os.environ[name] = value
-    os.environ["DATABASE_URL"] = database_url()
+    set_db_env()
 
     from shared import crypto
     from shared.db import engine

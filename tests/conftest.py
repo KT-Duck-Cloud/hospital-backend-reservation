@@ -1,7 +1,8 @@
 """테스트 설정. 두 가지로 돈다.
 
 1) 기본: 임시 SQLite DB (표는 모델로 만들고 끝나면 지운다). @pytest.mark.mysql 테스트는 건너뛴다.
-2) MySQL: 환경변수 TEST_MYSQL_URL(app_runtime 계정, schema.sql·seed.sql 이 들어간 버리는 DB)이 있으면
+2) MySQL: 환경변수 TEST_DB_URL(계정 없는 주소, schema.sql·seed.sql 이 들어간 버리는 DB) + TEST_DB_USERNAME(app_runtime)
+   + TEST_DB_PASSWORD 가 있으면
    @pytest.mark.mysql 테스트만 돈다. TEST_MYSQL_ADMIN_URL(관리자)이 있으면 read_only 전환 테스트도 돈다.
    표를 만들거나 지우지 않는다.
 
@@ -20,12 +21,16 @@ ROOT = next(p for p in [SERVICE_DIR, *SERVICE_DIR.parents] if (p / "shared").is_
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SERVICE_DIR))
 
-MYSQL_URL = os.environ.get("TEST_MYSQL_URL", "").strip()
+MYSQL_URL = os.environ.get("TEST_DB_URL", "").strip()
 if MYSQL_URL:
-    os.environ["DATABASE_URL"] = MYSQL_URL
+    os.environ["DB_URL"] = MYSQL_URL
+    os.environ["DB_USERNAME"] = os.environ.get("TEST_DB_USERNAME", "app_runtime")
+    os.environ["DB_PASSWORD"] = os.environ.get("TEST_DB_PASSWORD", "")
 else:
     _db = Path(tempfile.mkdtemp()) / "test.db"
-    os.environ["DATABASE_URL"] = f"sqlite:///{_db}"
+    os.environ["DB_URL"] = f"sqlite:///{_db}"
+    for _name in ("DB_USERNAME", "DB_PASSWORD"):  # SQLite 는 계정을 쓰지 않는다 (밖의 값이 섞이지 않게)
+        os.environ.pop(_name, None)
 os.environ["JWT_SECRET"] = secrets.token_urlsafe(48)
 os.environ.pop("READ_ONLY_MODE", None)
 
@@ -36,7 +41,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "mysql: 실제 MySQL(TEST_MYSQL_URL)에서만 도는 테스트")
+    config.addinivalue_line("markers", "mysql: 실제 MySQL(TEST_DB_URL)에서만 도는 테스트")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -45,7 +50,7 @@ def pytest_collection_modifyitems(config, items):
         if MYSQL_URL and not is_mysql:
             item.add_marker(pytest.mark.skip(reason="MySQL 모드: SQLite 용 테스트는 건너뜀"))
         if not MYSQL_URL and is_mysql:
-            item.add_marker(pytest.mark.skip(reason="TEST_MYSQL_URL 이 없어 건너뜀"))
+            item.add_marker(pytest.mark.skip(reason="TEST_DB_URL 이 없어 건너뜀"))
 
 
 # 테스트의 '지금'. 과거 시각 예약은 422 라서, 날짜를 박아 둔 테스트가 시간이 지나도 깨지지 않게 시계를 고정한다.

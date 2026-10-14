@@ -75,7 +75,9 @@ def test_record_then_verify_detects_deleted_and_changed(world, live_server, monk
         monkeypatch.setenv("VERIFIER_AUTH_URL", f"http://127.0.0.1:{auth.server_address[1]}")
         monkeypatch.setenv("VERIFIER_PASSWORD", PASSWORD)
         monkeypatch.setenv("VERIFIER_LOGIN_IDS", LOGIN_IDS)
-        monkeypatch.setenv("VERIFIER_DATABASE_URL", os.environ["DATABASE_URL"])  # 테스트 DB (운영은 app_readonly)
+        monkeypatch.setenv("VERIFIER_DB_URL", os.environ["DB_URL"])  # 테스트 DB (운영은 app_readonly)
+        monkeypatch.setenv("VERIFIER_DB_USERNAME", os.environ.get("DB_USERNAME", ""))
+        monkeypatch.setenv("VERIFIER_DB_PASSWORD", os.environ.get("DB_PASSWORD", ""))
         out = tmp_path / "drill.jsonl"
 
         assert dv.main(["record", "--out", str(out), "--count", "12", "--interval", "0", "--run-id", "e2e", "--seed", "1"]) == 0

@@ -1,4 +1,4 @@
-"""실제 MySQL 에서만 확인할 수 있는 것 (TEST_MYSQL_URL 이 있을 때만 돈다. conftest.py 참고).
+"""실제 MySQL 에서만 확인할 수 있는 것 (TEST_DB_URL 이 있을 때만 돈다. conftest.py 참고).
 
 - 같은 X-Request-ID 동시 20건 → 1건만 저장 (UNIQUE + 재조회)
 - DB 를 super_read_only 로 바꾸면 예약 생성이 503 WRITE_DISABLED (TEST_MYSQL_ADMIN_URL 필요)

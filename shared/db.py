@@ -1,11 +1,12 @@
 """DB 연결을 만드는 파일. SQLAlchemy 공통 방식만 써서 SQLite/MySQL 모두 동작한다."""
 import ssl
 
-from sqlalchemy import create_engine
+from sqlalchemy import URL, create_engine, make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from shared import config
-from shared.config import DATABASE_URL, DB_SSL_CA
+from shared.config import DB_SSL_CA
 
 # 이 서비스의 DB 계정이 쓰기 권한을 가졌는지. stats 는 조회 전용 계정(app_readonly)이라 False 로 바꾼다.
 _account_can_write = True
@@ -39,8 +40,33 @@ def mysql_ssl_context(ca_path: str = DB_SSL_CA) -> ssl.SSLContext:
     return context
 
 
-def build_connect_args(url: str) -> dict:
+def build_database_url(db_url: str, username: str, password: str) -> URL:
+    """DB_URL(계정 없는 주소) + DB_USERNAME + DB_PASSWORD → SQLAlchemy 접속 정보.
+
+    - mysql://호스트:3306/hospital → mysql+pymysql://, charset=utf8mb4 (없을 때만). 계정·비밀번호가 반드시 있어야 한다.
+    - sqlite:///파일 (테스트) → 계정을 쓰지 않는다.
+    돌려주는 URL 은 str()·repr() 해도 비밀번호가 *** 로 가려진다. 오류 메시지에는 값을 넣지 않는다.
+    """
+    try:
+        url = make_url(db_url)
+    except ArgumentError:
+        raise RuntimeError("환경변수 DB_URL 형식이 잘못되었습니다. 예) mysql://호스트:3306/hospital") from None
+    if url.username or url.password:
+        raise RuntimeError("DB_URL 에는 계정을 넣지 않습니다. 계정은 DB_USERNAME·DB_PASSWORD 로 넣으세요.")
+    backend = url.get_backend_name()
+    if backend == "sqlite":
+        return url
+    if backend != "mysql":
+        raise RuntimeError("DB_URL 은 mysql:// 또는 sqlite:// 만 지원합니다.")
+    if not username or not password:
+        raise RuntimeError("환경변수 DB_USERNAME·DB_PASSWORD 가 필요합니다.")
+    query = {"charset": "utf8mb4", **url.query}
+    return url.set(drivername="mysql+pymysql", username=username, password=password, query=query)
+
+
+def build_connect_args(url: str | URL) -> dict:
     """DB 종류별 연결 옵션"""
+    url = str(url)  # 비밀번호는 *** 로 가려진 문자열 (드라이버 이름만 본다)
     if url.startswith("sqlite"):
         # SQLite는 기본적으로 한 스레드에서만 쓰게 막혀 있어서, SQLite일 때만 옵션을 푼다.
         return {"check_same_thread": False}
@@ -50,9 +76,9 @@ def build_connect_args(url: str) -> dict:
     return {}
 
 
-def build_pool_args(url: str) -> dict:
+def build_pool_args(url: str | URL) -> dict:
     """연결 풀 설정 (shared/config.py 의 DB_POOL_*). SQLite(테스트)는 SQLAlchemy 기본 풀을 그대로 쓴다."""
-    if url.startswith("sqlite"):
+    if str(url).startswith("sqlite"):
         return {}
     return {
         "pool_size": config.DB_POOL_SIZE,
@@ -65,9 +91,10 @@ def build_pool_args(url: str) -> dict:
 # 엔진: DB와의 연결 통로 (만들 때는 접속하지 않는다)
 # pool_pre_ping: 연결을 꺼낼 때 살아 있는지 확인하고, 죽었으면 버리고 새로 연다 (DB 재시작·승격 뒤 자동 재연결).
 # hide_parameters: 오류 메시지·로그에 SQL 값(환자 정보 등)이 찍히지 않게 한다. echo 는 끈다 (요청 값 디버그 로그 금지).
+ENGINE_URL = build_database_url(config.DB_URL, config.DB_USERNAME, config.DB_PASSWORD)
 engine = create_engine(
-    DATABASE_URL, connect_args=build_connect_args(DATABASE_URL), pool_pre_ping=True, hide_parameters=True, echo=False,
-    **build_pool_args(DATABASE_URL),
+    ENGINE_URL, connect_args=build_connect_args(ENGINE_URL), pool_pre_ping=True, hide_parameters=True, echo=False,
+    **build_pool_args(ENGINE_URL),
 )
 
 

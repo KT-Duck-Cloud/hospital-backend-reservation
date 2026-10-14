@@ -13,6 +13,7 @@
 import contextvars
 import json
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -34,6 +35,10 @@ _REDACT_PATTERNS = [
 def redact(text: str) -> str:
     for pattern in _REDACT_PATTERNS:
         text = pattern.sub(lambda m: (m.group(1) + m.group(2) if m.lastindex == 2 else "") + "[REDACTED]", text)
+    # DB 비밀번호 값 자체가 어떤 모양으로든 섞여 들어오면 가린다
+    db_password = os.environ.get("DB_PASSWORD", "")
+    if len(db_password) >= 4 and db_password in text:
+        text = text.replace(db_password, "[REDACTED]")
     return text
 
 

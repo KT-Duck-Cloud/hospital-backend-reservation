@@ -3,10 +3,10 @@
 비밀번호는 코드·파일에 쓰지 않는다. 환경변수 SEED_PASSWORD 에서 읽어 bcrypt 로 해시한 값만 DB 에 넣는다.
 모든 테스트 계정이 같은 비밀번호를 쓴다 (비밀번호는 Git 이 아닌 다른 경로로 전달).
 
-DB 연결 (app_runtime 계정, TLS):
-  - 환경변수 DATABASE_URL 이 있으면 그대로 쓴다.
-  - 없으면 저장소 루트의 .env 에서 APP_RUNTIME_PASSWORD 를 읽어 DB_HOST(기본 127.0.0.1):DB_PORT(기본 3306) 로 붙는다.
-    (docker compose 의 mysql 을 PC 에서 바로 쓰는 경우)
+DB 연결 (app_runtime 계정, TLS). 앱과 같은 환경변수를 쓴다:
+  - DB_URL      계정 없는 주소. 없으면 mysql://127.0.0.1:3306/hospital (docker compose 의 mysql 을 PC 에서 바로 쓰는 경우)
+  - DB_USERNAME 없으면 app_runtime
+  - DB_PASSWORD 없으면 저장소 루트 .env 의 APP_RUNTIME_PASSWORD
 
 다시 실행해도 된다. 없는 계정은 새로 만들고, 이미 있는 계정은 비밀번호(password_hash)만 새 값으로 바꾼다.
 (역할·소속·활성 여부·로그인 잠금 상태는 그대로 둔다. 전체가 한 트랜잭션이라 중간에 실패하면 아무것도 바뀌지 않는다.)
@@ -20,7 +20,6 @@ DB 연결 (app_runtime 계정, TLS):
 import os
 import sys
 from pathlib import Path
-from urllib.parse import quote
 
 import bcrypt
 
@@ -30,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 MIN_PASSWORD_LENGTH = 10
 BCRYPT_MAX_BYTES = 72  # bcrypt 는 72바이트까지만 쓴다. 넘으면 오류로 알린다.
 BCRYPT_ROUNDS = 12
+DEFAULT_DB_URL = "mysql://127.0.0.1:3306/hospital"
 
 # (login_id, 이름, 역할, 부서 코드, 연결할 대상)
 #   연결할 대상: ("patient", 차트번호) → users.patient_id, ("doctor", 의사 이름) → doctors.user_id
@@ -59,16 +59,15 @@ def read_dotenv_value(key: str) -> str:
     return ""
 
 
-def database_url() -> str:
-    url = os.environ.get("DATABASE_URL", "").strip()
-    if url:
-        return url
-    password = read_dotenv_value("APP_RUNTIME_PASSWORD")
-    if not password:
-        sys.exit("DATABASE_URL 도 없고 .env 의 APP_RUNTIME_PASSWORD 도 없습니다. scripts/make_env.ps1 을 먼저 실행하세요.")
-    host = os.environ.get("DB_HOST", "127.0.0.1")
-    port = os.environ.get("DB_PORT", "3306")
-    return f"mysql+pymysql://app_runtime:{quote(password, safe='')}@{host}:{port}/hospital?charset=utf8mb4"
+def set_db_env() -> None:
+    """shared.db 가 읽는 DB_URL·DB_USERNAME·DB_PASSWORD 를 채운다 (이미 있는 값은 그대로). 값은 출력하지 않는다."""
+    os.environ["DB_URL"] = os.environ.get("DB_URL", "").strip() or DEFAULT_DB_URL
+    os.environ["DB_USERNAME"] = os.environ.get("DB_USERNAME", "").strip() or "app_runtime"
+    if not os.environ.get("DB_PASSWORD"):
+        password = read_dotenv_value("APP_RUNTIME_PASSWORD")
+        if not password:
+            sys.exit("DB_PASSWORD 도 없고 .env 의 APP_RUNTIME_PASSWORD 도 없습니다. scripts/make_env.ps1 을 먼저 실행하세요.")
+        os.environ["DB_PASSWORD"] = password
 
 
 def read_seed_password() -> bytes:
@@ -85,8 +84,8 @@ def read_seed_password() -> bytes:
 
 def main() -> None:
     password = read_seed_password()
-    # shared.db 는 import 할 때 DATABASE_URL 을 읽으므로 먼저 넣어 둔다. (TLS 설정을 앱과 똑같이 쓰기 위해)
-    os.environ["DATABASE_URL"] = database_url()
+    # shared.db 는 import 할 때 DB_URL·DB_USERNAME·DB_PASSWORD 를 읽으므로 먼저 넣어 둔다. (TLS 설정을 앱과 똑같이 쓰기 위해)
+    set_db_env()
 
     from sqlalchemy import text
 

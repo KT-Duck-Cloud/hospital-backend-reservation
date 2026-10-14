@@ -4,7 +4,9 @@
 - DB 가 멈춰 있는 동안 → 오래 묶이지 않고 503 DB_UNAVAILABLE, 다시 켜지면 200.
 
 실행 (저장소 루트, compose 의 mysql 이 떠 있을 때. 테스트용 계정·세션이 DB 에 남는다):
-  $env:TEST_MYSQL_URL = "mysql+pymysql://app_runtime:<비밀번호>@127.0.0.1:3306/hospital?charset=utf8mb4"
+  $env:TEST_DB_URL = "mysql://127.0.0.1:3306/hospital"
+  $env:TEST_DB_USERNAME = "app_runtime"
+  $env:TEST_DB_PASSWORD = "<비밀번호>"
   $env:RECOVERY_COMPOSE_SERVICE = "mysql"
   .venv\\Scripts\\python -m pytest services/reservation/tests/test_recovery.py
 """
@@ -36,9 +38,8 @@ def compose(*args: str) -> None:
 
 def wait_db_up() -> float:
     """앱과 따로, 새 연결로 DB 가 다시 받을 때까지 기다린다. 기다린 초를 돌려준다."""
-    from shared.db import build_connect_args
+    from shared.db import ENGINE_URL as url, build_connect_args
 
-    url = os.environ["DATABASE_URL"]
     probe = create_engine(url, connect_args=build_connect_args(url), poolclass=NullPool)
     started = time.monotonic()
     try:

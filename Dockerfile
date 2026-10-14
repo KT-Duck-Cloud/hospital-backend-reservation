@@ -26,7 +26,7 @@ ENV APP_VERSION=${APP_VERSION} \
     PYTHONUNBUFFERED=1 \
     FORWARDED_ALLOW_IPS=127.0.0.1
 
-# DATABASE_URL, READ_ONLY_MODE는 일부러 넣지 않는다. 실행할 때 -e 로 주입한다.
+# DB_URL·DB_USERNAME·DB_PASSWORD, READ_ONLY_MODE는 일부러 넣지 않는다. 실행할 때 -e 로 주입한다.
 
 RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
