@@ -146,7 +146,9 @@ def new_patient(client, world, login_id="nurse_im", **overrides):
 def test_create_patient_roles_and_rules(client, world):
     r = new_patient(client, world)
     assert r.status_code == 201
-    assert r.json()["chart_no"] == "N-100" and r.json()["phone"] == "010-1234-5678"
+    # 새 환자는 간호사 부서에 예약이 없어 번호가 가려진다 (공개 범위: tests/test_phone_visibility.py)
+    assert r.json()["chart_no"] == "N-100" and r.json()["phone"] == "010-****-5678"
+    assert r.json()["phone_is_masked"] is True
     assert ("PATIENT_CREATE", "SUCCESS", str(r.json()["id"])) in audit_actions()
     assert new_patient(client, world, "admin", chart_no="N-101").status_code == 201
     assert new_patient(client, world, "director", chart_no="N-102").status_code == 201
@@ -173,9 +175,9 @@ def test_search_patients(client, world):
     assert r.status_code == 200
     page = r.json()
     assert page["total"] == 2 and {i["name"] for i in page["items"]} == {"김하나", "이하나"}
-    masked = {i["chart_no"]: i["phone_masked"] for i in page["items"]}
-    assert masked == {"K-001": "010-****-2222", "K-002": "*******4444"}
-    assert "phone" not in page["items"][0]
+    masked = {i["chart_no"]: i["phone"] for i in page["items"]}
+    assert masked == {"K-001": "010-****-2222", "K-002": "*******4444"}  # 예약 없는 환자: 간호사에게도 가림
+    assert all(i["phone_is_masked"] for i in page["items"]) and "phone_masked" not in page["items"][0]
 
     assert client.get("/api/v1/patients", params={"q": "K-00"}, headers=world.h("director")).json()["total"] == 2
     assert client.get("/api/v1/patients", params={"q": "-001"}, headers=world.h("tester")).json()["total"] == 0  # 앞부분만
@@ -184,8 +186,11 @@ def test_search_patients(client, world):
     assert client.get("/api/v1/patients", params={"q": "_"}, headers=world.h("tester")).json()["total"] == 0
     assert client.get("/api/v1/patients", params={"q": ""}, headers=world.h("tester")).status_code == 422
     assert client.get("/api/v1/patients", headers=world.h("tester")).status_code == 422
-    for login_id in ("patient01", "head_im", "doctor", "manager", "admin", "dev"):
+    for login_id in ("patient01", "head_im", "doctor", "admin", "dev"):
         assert client.get("/api/v1/patients", params={"q": "하나"}, headers=world.h(login_id)).status_code == 403
+    # 원무과장은 전화번호 확인용으로 검색할 수 있다 (번호는 전체)
+    r = client.get("/api/v1/patients", params={"q": "하나"}, headers=world.h("manager"))
+    assert r.status_code == 200 and {i["phone"] for i in r.json()["items"]} == {"010-1111-2222", "01033334444"}
 
 
 def test_patient_detail_scope_and_audit(client, world):
@@ -200,8 +205,12 @@ def test_patient_detail_scope_and_audit(client, world):
     assert ("PATIENT_VIEW", "SUCCESS", str(pid)) in audit_actions()
 
     assert client.get("/api/v1/patients/99999", headers=world.h("director")).status_code == 404
-    for login_id in ("patient01", "head_im", "doctor", "manager", "admin", "dev"):
+    for login_id in ("head_im", "doctor", "admin", "dev"):
         assert client.get(f"/api/v1/patients/{pid}", headers=world.h(login_id)).status_code == 403
+    # 환자는 본인 기록만 (patient01 = C-1)
+    assert client.get(f"/api/v1/patients/{pid}", headers=world.h("patient01")).status_code == 200
+    other = world.ids["C-2"]
+    assert client.get(f"/api/v1/patients/{other}", headers=world.h("patient01")).status_code == 403
 
 
 def test_recent_reservations_limited_to_10(client, world):

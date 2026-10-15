@@ -49,5 +49,8 @@ JWT_ISSUER = os.getenv("JWT_ISSUER", "hospital-reservation").strip()
 # bcrypt 비용. 운영 12. 테스트에서만 낮춘다.
 BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
 
+# 병원 대표 번호 (연락처 화면용). 실제 번호는 배포 환경에서 넣는다. 비어 있으면 응답의 hospital_phone 은 null.
+HOSPITAL_PHONE = os.getenv("HOSPITAL_PHONE", "").strip()
+
 # 사이트 이름 (hospital / krdr / aws). 시스템 상태(S1) 표시용
 SITE_NAME = os.getenv("SITE_NAME", "unknown").strip() or "unknown"

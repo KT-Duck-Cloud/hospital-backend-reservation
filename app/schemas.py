@@ -15,7 +15,7 @@ Id = Annotated[int, Field(ge=1, le=2**63 - 1)]
 Memo = Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)]
 VisitType = Literal["FIRST", "RETURN"]
 Status = Literal["BOOKED", "CANCELED"]
-CheckinStatus = Literal["NOT_CHECKED_IN", "CHECKED_IN"]
+CheckinStatus = Literal["NOT_CHECKED_IN", "CHECKED_IN", "IN_TREATMENT", "COMPLETED"]
 
 MAX_PAGE_SIZE = 100
 
@@ -153,6 +153,8 @@ class DepartmentOut(BaseModel):
     id: int
     code: str
     name: str
+    phone: str | None = None            # 부서 대표 번호. 역할에 따라 가린 값 (shared/phone.py)
+    phone_is_masked: bool = False
 
 
 class DoctorOut(BaseModel):
@@ -165,12 +167,13 @@ class DoctorOut(BaseModel):
 
 
 class PatientSummary(BaseModel):
-    """환자 검색 결과. 전화번호는 가운데를 가린다."""
+    """환자 검색 결과. phone 은 역할에 따라 전체 번호 또는 가린 번호 (shared/phone.py)."""
     id: int
     chart_no: str
     name: str
     birth_date: date
-    phone_masked: str | None
+    phone: str | None
+    phone_is_masked: bool
 
 
 class PatientPage(BaseModel):
@@ -187,8 +190,26 @@ class PatientOut(BaseModel):
     chart_no: str
     name: str
     birth_date: date
-    phone: str | None
+    phone: str | None               # 역할에 따라 전체 번호 또는 가린 번호
+    phone_is_masked: bool
     created_at: UtcDateTime
+
+
+class StaffOut(BaseModel):
+    """직원 연락처 목록 (R18). work_phone 은 역할에 따라 전체 번호 또는 가린 번호."""
+    id: int
+    name: str
+    role: str
+    department_id: int | None
+    work_phone: str | None
+    work_phone_is_masked: bool
+
+
+class ContactsOut(BaseModel):
+    """연락처 화면 (R19). 직원 목록은 역할마다 범위가 다르다 (shared/phone.py)."""
+    hospital_phone: str | None       # 병원 대표 번호 (HOSPITAL_PHONE). 설정이 없으면 null
+    departments: list[DepartmentOut]
+    staff: list[StaffOut]
 
 
 class PatientDetail(PatientOut):
@@ -204,13 +225,14 @@ class QueueItem(BaseModel):
     chart_no: str
     doctor_id: int | None
     doctor_name: str | None
+    checkin_status: CheckinStatus   # CHECKED_IN 진료대기 / IN_TREATMENT 진료중 / COMPLETED 진료완료
     reserved_at: UtcDateTime
     checked_in_at: UtcDateTime
 
 
 class QueueOut(BaseModel):
     date: dt.date                   # KST 날짜
-    department_id: int | None       # DIRECTOR·TESTER 가 고르지 않으면 null (전체)
+    department_id: int | None       # DIRECTOR·TESTER 가 고르지 않으면 null (전체). 의사 대기열은 의사의 진료과
     items: list[QueueItem]          # 진료과, 대기번호 순
 
 

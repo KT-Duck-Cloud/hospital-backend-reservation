@@ -135,7 +135,7 @@ ROLE_CAN = {
     "director": (True, True, True, True),
     "tester": (True, True, True, True),
     "doctor": (False, False, False, False),
-    "manager": (False, False, False, False),
+    "manager": (False, True, True, True),   # 원무과장: 부서와 상관없이 조회·접수·취소 (만들기는 불가)
     "admin": (False, False, False, False),
     "dev": (False, False, False, False),
 }

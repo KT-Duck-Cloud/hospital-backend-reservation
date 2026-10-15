@@ -31,6 +31,8 @@ class User(Base):
     login_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str] = mapped_column(String(50), nullable=False)
+    # 직원 업무용 연락처 (환자 계정은 NULL). 응답에서는 shared/phone.py 규칙으로만 공개한다
+    work_phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     department_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     patient_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, unique=True)  # 환자 1명에 계정 1개

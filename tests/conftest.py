@@ -88,12 +88,25 @@ USERS = {
     "nurse_im": ("NURSE", "IM", None),
     "nurse_os": ("NURSE", "OS", None),
     "head_im": ("DEPT_HEAD", "IM", None),
+    "head_os": ("DEPT_HEAD", "OS", None),
     "director": ("DIRECTOR", None, None),
     "tester": ("TESTER", None, None),
-    "doctor": ("DOCTOR", "IM", None),
+    "doctor": ("DOCTOR", "IM", None),        # 의사 dr_im 의 계정
+    "doctor_os": ("DOCTOR", "OS", None),     # 의사 dr_os 의 계정
     "manager": ("MANAGER", "ADM", None),
     "admin": ("ADMIN", None, None),
     "dev": ("DEVELOPER", None, None),
+}
+
+
+# 가짜 전화번호 (전화번호 공개 범위 테스트용: tests/test_phone_visibility.py)
+DEPT_PHONES = {"IM": "02-1000-0101", "OS": "02-1000-0102", "ADM": "02-1000-0100"}
+PATIENT_PHONES = {"C-1": "010-1111-1001", "C-2": "010-2222-1002"}
+WORK_PHONES = {
+    "nurse_im": "02-3000-0201", "nurse_os": "02-3000-0202", "head_im": "02-3000-0203",
+    "director": "02-3000-0204", "tester": "02-3000-0205", "doctor": "02-3000-0206",
+    "doctor_os": "02-3000-0207", "manager": "02-3000-0208", "admin": "02-3000-0209", "dev": "02-3000-0210",
+    "head_os": "02-3000-0211",
 }
 
 
@@ -121,7 +134,7 @@ def world():
     ids = {}
     with SessionLocal() as db:
         for code, name in (("IM", "내과"), ("OS", "정형외과"), ("ADM", "원무과")):
-            d = models.Department(code=code, name=name)
+            d = models.Department(code=code, name=name, phone=DEPT_PHONES[code])
             db.add(d)
             db.flush()
             ids[code] = d.id
@@ -131,18 +144,22 @@ def world():
             db.flush()
             ids[key] = doc.id
         for chart in ("C-1", "C-2"):
-            p = models.Patient(chart_no=chart, name=f"환자{chart}", birth_date=date(1990, 1, 1))
+            p = models.Patient(chart_no=chart, name=f"환자{chart}", birth_date=date(1990, 1, 1),
+                               phone=PATIENT_PHONES[chart])
             db.add(p)
             db.flush()
             ids[chart] = p.id
         headers = {}
         for login_id, (role, dept, chart) in USERS.items():
             u = User(login_id=login_id, password_hash="!", name=login_id, role=role,
-                     department_id=ids.get(dept), patient_id=ids.get(chart))
+                     department_id=ids.get(dept), patient_id=ids.get(chart), work_phone=WORK_PHONES.get(login_id))
             db.add(u)
             db.flush()
             ids[login_id] = u.id
             headers[login_id] = {"Authorization": f"Bearer {make_token(db, u)}"}
+        # 의사 계정 연결: 진료 시작·완료는 doctors.user_id 로 "담당 의사"를 가린다
+        for doctor_key, login_id in (("dr_im", "doctor"), ("dr_os", "doctor_os")):
+            db.get(models.Doctor, ids[doctor_key]).user_id = ids[login_id]
         db.commit()
     yield World(ids, headers)
     Base.metadata.drop_all(engine)

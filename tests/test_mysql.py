@@ -91,10 +91,11 @@ def test_create_is_503_when_db_is_read_only(client, director_headers):
 def test_checkin_cancel_and_list_on_mysql(client, director_headers):
     headers, ids = director_headers
     tag = secrets.token_hex(4)
-    # 아무도 안 쓰는 먼 날짜라 대기번호가 1부터 시작한다 (KST 2030-01-02 10:00, 11:00)
-    first = client.post(URL, json={**payload(ids), "reserved_at": "2030-01-02T01:00:00Z"},
+    # 실행마다 다른 먼 날짜라 대기번호가 1부터 시작한다 (KST 10:00, 11:00)
+    day = f"2034-{secrets.randbelow(12) + 1:02d}-{secrets.randbelow(28) + 1:02d}"
+    first = client.post(URL, json={**payload(ids), "reserved_at": f"{day}T01:00:00Z"},
                         headers={**headers, "X-Request-ID": f"q1-{tag}"}).json()
-    second = client.post(URL, json={**payload(ids), "reserved_at": "2030-01-02T02:00:00Z"},
+    second = client.post(URL, json={**payload(ids), "reserved_at": f"{day}T02:00:00Z"},
                          headers={**headers, "X-Request-ID": f"q2-{tag}"}).json()
     a = client.post(f"{URL}/{second['id']}/checkin", headers=headers).json()
     b = client.post(f"{URL}/{first['id']}/checkin", headers=headers).json()
@@ -104,7 +105,7 @@ def test_checkin_cancel_and_list_on_mysql(client, director_headers):
     canceled = client.delete(f"{URL}/{first['id']}", headers=headers).json()
     assert canceled["status"] == "CANCELED" and canceled["canceled_at"]
 
-    page = client.get(URL, params={"date_from": "2030-01-02", "date_to": "2030-01-02",
+    page = client.get(URL, params={"date_from": day, "date_to": day,
                                    "department_id": ids["department_id"]}, headers=headers).json()
     assert {i["id"] for i in page["items"]} >= {first["id"], second["id"]}
 
@@ -141,3 +142,77 @@ def test_same_doctor_same_time_10_concurrent_only_one_booked(client, director_he
             models.Reservation.doctor_id == doctor_id, models.Reservation.status == "BOOKED",
             models.Reservation.request_id.like(f"slot-{tag}-%")))
     assert booked == 1
+
+
+def test_10_concurrent_checkins_get_distinct_queue_numbers(client, director_headers):
+    """같은 진료과·같은 날 10건을 동시에 접수하면 대기번호가 1~10 으로 겹치지 않는다 (UNIQUE + 재시도)."""
+    from app import models
+    from shared.db import SessionLocal
+
+    headers, ids = director_headers
+    tag = secrets.token_hex(4)
+    day = f"2032-{secrets.randbelow(12) + 1:02d}-{secrets.randbelow(28) + 1:02d}"  # 아무도 안 쓰는 먼 날짜
+    reservation_ids = []
+    for i in range(10):
+        r = client.post(URL, json={**payload(ids), "reserved_at": f"{day}T0{i // 2}:{(i % 2) * 30:02d}:00Z"},
+                        headers={**headers, "X-Request-ID": f"cq-{tag}-{i}"})
+        assert r.status_code == 201, r.text
+        reservation_ids.append(r.json()["id"])
+
+    barrier = threading.Barrier(10)
+    results = []
+
+    def send(rid):
+        barrier.wait()
+        r = client.post(f"{URL}/{rid}/checkin", headers=headers)
+        results.append((r.status_code, r.json().get("queue_no")))
+
+    threads = [threading.Thread(target=send, args=(rid,)) for rid in reservation_ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert [code for code, _ in results] == [200] * 10, results
+    assert sorted(no for _, no in results) == list(range(1, 11))
+    with SessionLocal() as db:
+        saved = db.scalars(select(models.Reservation.queue_no).where(models.Reservation.id.in_(reservation_ids))).all()
+    assert sorted(saved) == list(range(1, 11))
+
+
+def test_record_and_receipt_must_match_reservation_patient_on_mysql(client, director_headers):
+    """MySQL 의 복합 외래키 (reservation_id, patient_id) → reservations (id, patient_id): 다른 환자는 저장 거부."""
+    from app import models
+    from shared.db import SessionLocal, engine
+    from sqlalchemy.exc import IntegrityError
+
+    headers, ids = director_headers
+    tag = secrets.token_hex(4)
+    r = client.post(URL, json={**payload(ids), "reserved_at": "2033-03-03T01:00:00Z"},
+                    headers={**headers, "X-Request-ID": f"fk-{tag}"})
+    assert r.status_code == 201, r.text
+    reservation_id = r.json()["id"]
+    with SessionLocal() as db:
+        other_patient = db.scalar(select(models.Patient.id).where(models.Patient.id != ids["patient_id"]).limit(1))
+        doctor_id = db.scalar(select(models.Doctor.id).limit(1))
+
+    record = text(
+        "INSERT INTO medical_records (patient_id, reservation_id, doctor_id, diagnosis_enc, note_enc, "
+        "diagnosis_nonce, note_nonce, key_version, created_at, updated_at) VALUES (:p, :r, :d, 'x', 'x', "
+        "UNHEX('000000000000000000000000'), UNHEX('000000000000000000000000'), 1, NOW(6), NOW(6))")
+    receipt = text("INSERT INTO receipts (patient_id, reservation_id, amount, pay_status, created_at, updated_at) "
+                   "VALUES (:p, :r, 1000, 'UNPAID', NOW(6), NOW(6))")
+
+    for stmt, extra in ((record, {"d": doctor_id}), (receipt, {})):
+        with pytest.raises(IntegrityError):  # 다른 환자
+            with engine.begin() as conn:
+                conn.execute(stmt, {"p": other_patient, "r": reservation_id, **extra})
+        with engine.begin() as conn:  # 같은 환자
+            conn.execute(stmt, {"p": ids["patient_id"], "r": reservation_id, **extra})
+        with pytest.raises(IntegrityError):  # 예약 1건에 1건만
+            with engine.begin() as conn:
+                conn.execute(stmt, {"p": ids["patient_id"], "r": reservation_id, **extra})
+    # 기록이 붙은 예약의 환자는 바꿀 수 없다
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE reservations SET patient_id = :p WHERE id = :r"),
+                         {"p": other_patient, "r": reservation_id})

@@ -4,7 +4,11 @@
 - PATIENT          : 본인(patient_id) 예약만
 - NURSE, DEPT_HEAD : 자기 부서(department_id) 예약만
 - DIRECTOR, TESTER : 전체
-범위 밖이면 403 + 감사 로그 DENIED. 예약 생성·취소·접수는 같은 트랜잭션으로 감사 로그를 남긴다.
+- MANAGER(원무과장): 부서와 상관없이 예약 조회·접수·취소 (예약 만들기는 불가). 응답의 예약 메모(memo)는 비운다
+범위 밖이면 403 + 감사 로그 DENIED. 예약 생성·취소·접수·진료 시작·진료 완료는 같은 트랜잭션으로 감사 로그를 남긴다.
+
+진료 진행 (reservations.checkin_status): NOT_CHECKED_IN → CHECKED_IN(진료대기) → IN_TREATMENT(진료중) → COMPLETED(진료완료).
+앞으로만 간다. 진료 시작·완료는 그 예약의 담당 의사(doctors.user_id = 로그인 계정, doctor_id 일치)만 할 수 있다.
 """
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,25 +17,32 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, selectinload
 
 from app import models, schemas
 from shared import audit, config, crypto, timeutil
 from shared.auth import CurrentUser, enforce_permissions, get_current_user, require_jwt_secret
 from shared.db import get_db
-from shared.errors import bad_request, conflict, forbidden, install_error_handlers, not_found
+from shared.errors import (
+    ApiError, bad_request, conflict, forbidden, install_error_handlers, mysql_error_code, not_found,
+)
 from shared.middleware import install_read_only_guard, install_request_id
-from shared.models import utcnow
+from shared.models import User, utcnow
 from shared.ops import install_ops
 from shared.timeutil import kst_date_of, kst_day_range_utc, today_kst
-from shared.permissions import DEPT_HEAD, DIRECTOR, NURSE, PATIENT, TESTER
+from shared.permissions import DEPT_HEAD, DIRECTOR, DOCTOR, MANAGER, NURSE, PATIENT, TESTER
+from shared.phone import (  # noqa: F401  (mask_phone: 기존 import 경로 유지)
+    can_see_department_phone, can_see_patient_phone, can_see_staff_phone, mask_phone, shown,
+)
 
 SERVICE_NAME = "reservation"
 MAX_REQUEST_ID_LENGTH = 64
 
 DEPARTMENT_SCOPE_ROLES = frozenset({NURSE, DEPT_HEAD})
 ALL_SCOPE_ROLES = frozenset({DIRECTOR, TESTER})
+# 원무과장: 예약 조회·접수·취소는 전체 부서. 대기열(R8)·예약 만들기(R1)는 권한 표에서 막혀 있다.
+FRONT_DESK_ROLES = frozenset({MANAGER})
 
 require_jwt_secret()  # JWT_SECRET 이 없으면 시작하지 않는다.
 
@@ -58,7 +69,18 @@ def in_scope(user: CurrentUser, reservation: models.Reservation) -> bool:
         return user.patient_id is not None and reservation.patient_id == user.patient_id
     if user.role in DEPARTMENT_SCOPE_ROLES:
         return user.department_id is not None and reservation.department_id == user.department_id
-    return user.role in ALL_SCOPE_ROLES
+    return user.role in ALL_SCOPE_ROLES or user.role in FRONT_DESK_ROLES
+
+
+def reservation_view(user: CurrentUser, reservation: models.Reservation) -> schemas.ReservationOut:
+    """예약 응답. 원무과장에게는 예약 메모(진료 관련 내용이 적힐 수 있음)를 주지 않는다.
+
+    진단·진료 메모(medical_records)는 이 서비스의 R11(PATIENT 본인) 말고는 어떤 응답에도 넣지 않는다.
+    """
+    view = schemas.ReservationOut.model_validate(reservation)
+    if user.role == MANAGER:
+        view.memo = None
+    return view
 
 
 def load_in_scope(db: Session, request: Request, user: CurrentUser, reservation_id: int,
@@ -205,7 +227,7 @@ def list_reservations(
         ):
             deny(request, user, "department", filters.department_id)
         conditions.append(R.department_id == user.department_id)
-    elif user.role not in ALL_SCOPE_ROLES:
+    elif user.role not in ALL_SCOPE_ROLES and user.role not in FRONT_DESK_ROLES:
         deny(request, user, "reservation", None)
 
     if filters.department_id is not None:
@@ -226,7 +248,8 @@ def list_reservations(
         select(R).options(selectinload(R.patient)).where(*conditions).order_by(R.reserved_at, R.id)
         .offset((filters.page - 1) * filters.size).limit(filters.size)
     ).all()
-    return {"items": items, "page": filters.page, "size": filters.size, "total": total}
+    return {"items": [reservation_view(user, r) for r in items], "page": filters.page, "size": filters.size,
+            "total": total}
 
 
 # ---------- R3 예약 상세 ----------
@@ -237,7 +260,7 @@ def get_reservation(
     user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     """예약 한 건. 없으면 404, 범위 밖이면 403."""
-    return load_in_scope(db, request, user, reservation_id)
+    return reservation_view(user, load_in_scope(db, request, user, reservation_id))
 
 
 # ---------- R4 취소 ----------
@@ -247,8 +270,13 @@ def cancel_reservation(
     reservation_id: int, request: Request,
     user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db),
 ):
-    """예약 취소. 행은 지우지 않고 status=CANCELED, canceled_at 기록. 이미 취소면 그대로 200."""
+    """예약 취소. 행은 지우지 않고 status=CANCELED, canceled_at 기록. 이미 취소면 그대로 200.
+
+    진료중(IN_TREATMENT)·진료완료(COMPLETED) 예약은 취소할 수 없다 (409).
+    """
     reservation = load_in_scope(db, request, user, reservation_id, for_update=True)
+    if reservation.checkin_status in TREATMENT_STARTED:
+        raise conflict("진료가 시작된 예약은 취소할 수 없습니다")
     if reservation.status != "CANCELED":
         now = utcnow()
         reservation.status = "CANCELED"
@@ -258,48 +286,151 @@ def cancel_reservation(
                         target_type="reservation", target_id=reservation.id)
         db.commit()
         db.refresh(reservation)
-    return reservation
+    return reservation_view(user, reservation)
 
 
 # ---------- R5 접수 ----------
+
+QUEUE_RETRIES = 5  # 대기번호가 겹치거나 교착이 나면 처음부터 다시 (예약 잠금 → 번호 계산 → 저장)
+MYSQL_DEADLOCK = 1213
+
+
+def next_queue_no(db: Session, department_id: int, queue_date) -> int:
+    """그 진료과·그 날짜의 다음 대기번호.
+
+    진료과 행을 먼저 잠가 같은 진료과의 접수를 한 줄로 세운다. 번호가 아직 하나도 없는 날은 MAX 의 FOR UPDATE 가
+    빈 구간(gap) 잠금이 되어 동시 접수끼리 교착이 나므로, 존재하는 행(진료과)을 잠그는 것이 안전하다.
+    그래도 겹치면 UNIQUE(department_id, queue_date, queue_no) 가 막고, 호출한 쪽이 다시 시도한다.
+    """
+    db.execute(select(models.Department.id).where(models.Department.id == department_id).with_for_update())
+    R = models.Reservation
+    last_no = db.scalar(
+        select(func.max(R.queue_no)).where(R.department_id == department_id, R.queue_date == queue_date)
+        .with_for_update()
+    )
+    return (last_no or 0) + 1
+
+
+def is_queue_collision(error: Exception) -> bool:
+    """대기번호 UNIQUE 위반 또는 MySQL 교착이면 True (다시 시도하면 되는 오류)."""
+    if mysql_error_code(error) == MYSQL_DEADLOCK:
+        return True
+    return isinstance(error, IntegrityError) and "queue" in str(getattr(error, "orig", error)).lower()
+
 
 @api.post("/reservations/{reservation_id}/checkin", response_model=schemas.ReservationOut)
 def checkin_reservation(
     reservation_id: int, request: Request,
     user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db),
 ):
-    """현장 접수. 취소된 예약은 409, 이미 접수면 그대로 200. 대기번호는 진료과·날짜(KST)별 1번부터."""
-    reservation = load_in_scope(db, request, user, reservation_id, for_update=True)
-    if reservation.status == "CANCELED":
-        raise conflict("취소된 예약은 접수할 수 없습니다")
-    if reservation.checkin_status != "CHECKED_IN":
-        R = models.Reservation
-        day_start, day_end = kst_day_range_utc(kst_date_of(reservation.reserved_at))
-        # FOR UPDATE: 같은 진료과·같은 날 동시 접수가 같은 번호를 받지 않도록 그 범위를 잠근다.
-        last_no = db.scalar(
-            select(func.max(R.queue_no)).where(
-                R.department_id == reservation.department_id,
-                R.reserved_at >= day_start, R.reserved_at < day_end,
-            ).with_for_update()
-        )
-        now = utcnow()
-        reservation.checkin_status = "CHECKED_IN"
-        reservation.checked_in_at = now
-        reservation.queue_no = (last_no or 0) + 1
-        reservation.updated_at = now
-        audit.add_audit(db, request, "RESERVATION_CHECKIN", audit.SUCCESS, user_id=user.id,
-                        target_type="reservation", target_id=reservation.id)
-        db.commit()
+    """현장 접수. 취소된 예약은 409, 이미 접수(진료중·완료 포함)면 그대로 200.
+
+    대기번호는 진료과·날짜(KST)별 1번부터. 그 날짜가 reservations.queue_date 에 저장된다.
+    """
+    for _ in range(QUEUE_RETRIES):
+        try:
+            reservation = load_in_scope(db, request, user, reservation_id, for_update=True)
+            if reservation.status == "CANCELED":
+                raise conflict("취소된 예약은 접수할 수 없습니다")
+            if reservation.checkin_status != "NOT_CHECKED_IN":
+                return reservation_view(user, reservation)
+            queue_date = kst_date_of(reservation.reserved_at)
+            now = utcnow()
+            reservation.checkin_status = "CHECKED_IN"
+            reservation.checked_in_at = now
+            reservation.queue_date = queue_date
+            reservation.queue_no = next_queue_no(db, reservation.department_id, queue_date)
+            reservation.updated_at = now
+            audit.add_audit(db, request, "RESERVATION_CHECKIN", audit.SUCCESS, user_id=user.id,
+                            target_type="reservation", target_id=reservation.id)
+            db.commit()
+        except (IntegrityError, OperationalError) as exc:
+            db.rollback()
+            if not is_queue_collision(exc):
+                raise
+            continue  # 다른 접수와 번호가 겹침: 취소하고 처음부터 다시
         db.refresh(reservation)
+        return reservation_view(user, reservation)
+    raise ApiError(503, "DB_UNAVAILABLE", "접수가 몰려 처리하지 못했습니다. 잠시 후 다시 시도하세요")
+
+
+# ---------- R15 진료 시작 · R16 진료 완료 (담당 의사만) ----------
+
+# 새 상태 → (바로 앞 상태, 감사 로그 action)
+TREATMENT_STEPS = {
+    "IN_TREATMENT": ("CHECKED_IN", "TREATMENT_START"),
+    "COMPLETED": ("IN_TREATMENT", "TREATMENT_COMPLETE"),
+}
+TREATMENT_STARTED = frozenset({"IN_TREATMENT", "COMPLETED"})
+
+
+def doctor_of(db: Session, user: CurrentUser) -> models.Doctor | None:
+    """로그인 계정에 연결된 의사 (doctors.user_id). 연결이 없으면 None."""
+    return db.scalar(select(models.Doctor).where(models.Doctor.user_id == user.id))
+
+
+def advance_treatment(db: Session, request: Request, user: CurrentUser, reservation_id: int, new_status: str):
+    """진료 상태를 한 칸 앞으로. 담당 의사가 아니면 403(+DENIED), 순서가 틀리면 409.
+
+    이미 그 상태면 그대로 200 (접수·취소와 같은 방식). 건너뛰기·되돌리기는 409.
+    """
+    previous, action = TREATMENT_STEPS[new_status]
+    reservation = db.scalar(
+        select(models.Reservation).where(models.Reservation.id == reservation_id).with_for_update())
+    if reservation is None:
+        raise not_found("예약을 찾을 수 없습니다")
+    doctor = doctor_of(db, user)
+    if doctor is None or reservation.doctor_id != doctor.id:
+        deny(request, user, "reservation", reservation_id)
+    if reservation.status == "CANCELED":
+        raise conflict("취소된 예약은 진료할 수 없습니다")
+    if reservation.checkin_status == new_status:
+        return reservation
+    if reservation.checkin_status != previous:
+        raise conflict("진료 상태는 접수 → 진료 시작 → 진료 완료 순서로만 바꿀 수 있습니다")
+    reservation.checkin_status = new_status
+    reservation.updated_at = utcnow()
+    audit.add_audit(db, request, action, audit.SUCCESS, user_id=user.id,
+                    target_type="reservation", target_id=reservation.id)
+    db.commit()
+    db.refresh(reservation)
     return reservation
+
+
+@api.post("/reservations/{reservation_id}/start-treatment", response_model=schemas.ReservationOut)
+def start_treatment(
+    reservation_id: int, request: Request,
+    user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    """진료 시작: CHECKED_IN → IN_TREATMENT. 담당 의사만."""
+    return advance_treatment(db, request, user, reservation_id, "IN_TREATMENT")
+
+
+@api.post("/reservations/{reservation_id}/complete-treatment", response_model=schemas.ReservationOut)
+def complete_treatment(
+    reservation_id: int, request: Request,
+    user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    """진료 완료: IN_TREATMENT → COMPLETED. 담당 의사만."""
+    return advance_treatment(db, request, user, reservation_id, "COMPLETED")
 
 
 # ---------- R6 진료과 / R7 의사 ----------
 
+def department_list(db: Session, user: CurrentUser) -> list[schemas.DepartmentOut]:
+    rows = db.scalars(select(models.Department).order_by(models.Department.id)).all()
+    out = []
+    for d in rows:
+        visible = can_see_department_phone(user.role, d.code)
+        out.append(schemas.DepartmentOut(id=d.id, code=d.code, name=d.name, phone=shown(d.phone, visible),
+                                         phone_is_masked=bool(d.phone) and not visible))
+    return out
+
+
 @api.get("/departments", response_model=list[schemas.DepartmentOut])
-def list_departments(db: Session = Depends(get_db)):
-    """진료과 목록 (예약 화면 선택용)"""
-    return db.scalars(select(models.Department).order_by(models.Department.id)).all()
+def list_departments(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    """진료과 목록 (예약 화면 선택용). 대표 번호는 역할에 따라 가린다 (shared/phone.py)."""
+    return department_list(db, user)
 
 
 @api.get("/doctors", response_model=list[schemas.DoctorOut])
@@ -313,6 +444,34 @@ def list_doctors(filters: Annotated[schemas.DoctorFilter, Query()], db: Session 
 
 # ---------- R8 오늘 대기열 ----------
 
+def queue_items(db: Session, day, department_id: int | None = None,
+                doctor_id: int | None = None) -> list[schemas.QueueItem]:
+    """그날(KST) 접수된(취소 아님) 예약을 진료과·대기번호 순으로. 진료대기·진료중·진료완료가 모두 나온다."""
+    start, end = kst_day_range_utc(day)
+    R, P, D = models.Reservation, models.Patient, models.Doctor
+    stmt = (
+        select(R, P.name, P.chart_no, D.name)
+        .join(P, P.id == R.patient_id)
+        .outerjoin(D, D.id == R.doctor_id)
+        .where(R.reserved_at >= start, R.reserved_at < end,
+               R.status == "BOOKED", R.checkin_status != "NOT_CHECKED_IN")
+        .order_by(R.department_id, R.queue_no, R.checked_in_at, R.id)
+    )
+    if department_id is not None:
+        stmt = stmt.where(R.department_id == department_id)
+    if doctor_id is not None:
+        stmt = stmt.where(R.doctor_id == doctor_id)
+    return [
+        schemas.QueueItem(
+            reservation_id=r.id, queue_no=r.queue_no or 0, department_id=r.department_id,
+            patient_id=r.patient_id, patient_name=patient_name, chart_no=chart_no,
+            doctor_id=r.doctor_id, doctor_name=doctor_name, checkin_status=r.checkin_status,
+            reserved_at=r.reserved_at, checked_in_at=r.checked_in_at,
+        )
+        for r, patient_name, chart_no, doctor_name in db.execute(stmt).all()
+    ]
+
+
 @api.get("/queue", response_model=schemas.QueueOut)
 def get_queue(
     request: Request,
@@ -320,7 +479,10 @@ def get_queue(
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """접수된 예약을 대기번호 순으로. NURSE·DEPT_HEAD 는 자기 부서만, DIRECTOR·TESTER 는 department_id 로 고른다(없으면 전체)."""
+    """접수된 예약을 대기번호 순으로 (각 항목의 checkin_status 로 진료대기·진료중·진료완료 구분).
+
+    NURSE·DEPT_HEAD 는 자기 부서만, DIRECTOR·TESTER 는 department_id 로 고른다(없으면 전체).
+    """
     if user.role in DEPARTMENT_SCOPE_ROLES:
         if user.department_id is None or (
             filters.department_id is not None and filters.department_id != user.department_id
@@ -333,64 +495,58 @@ def get_queue(
         deny(request, user, "queue", None)
 
     day = filters.date or today_kst()
-    start, end = kst_day_range_utc(day)
-    R, P, D = models.Reservation, models.Patient, models.Doctor
-    stmt = (
-        select(R, P.name, P.chart_no, D.name)
-        .join(P, P.id == R.patient_id)
-        .outerjoin(D, D.id == R.doctor_id)
-        .where(R.reserved_at >= start, R.reserved_at < end,
-               R.status == "BOOKED", R.checkin_status == "CHECKED_IN")
-        .order_by(R.department_id, R.queue_no, R.checked_in_at, R.id)
-    )
-    if department_id is not None:
-        stmt = stmt.where(R.department_id == department_id)
-    items = [
-        schemas.QueueItem(
-            reservation_id=r.id, queue_no=r.queue_no or 0, department_id=r.department_id,
-            patient_id=r.patient_id, patient_name=patient_name, chart_no=chart_no,
-            doctor_id=r.doctor_id, doctor_name=doctor_name, reserved_at=r.reserved_at, checked_in_at=r.checked_in_at,
-        )
-        for r, patient_name, chart_no, doctor_name in db.execute(stmt).all()
-    ]
-    return schemas.QueueOut(date=day, department_id=department_id, items=items)
+    return schemas.QueueOut(date=day, department_id=department_id, items=queue_items(db, day, department_id))
+
+
+@api.get("/doctor/queue", response_model=schemas.QueueOut)
+def get_doctor_queue(
+    request: Request,
+    filters: Annotated[schemas.QueueFilter, Query()],
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """의사 화면용 대기열: 로그인한 의사 본인이 담당인 접수된 예약만. department_id 는 받지 않는다."""
+    doctor = doctor_of(db, user)
+    if doctor is None or filters.department_id is not None:
+        deny(request, user, "doctor", filters.department_id)
+    day = filters.date or today_kst()
+    return schemas.QueueOut(date=day, department_id=doctor.department_id,
+                            items=queue_items(db, day, doctor_id=doctor.id))
 
 
 # ---------- R9 환자 검색 · R10 환자 상세 · 환자 등록 ----------
 
-def mask_phone(phone: str | None) -> str | None:
-    """010-1234-5678 → 010-****-5678. 형식이 다르면 끝 4자리만 남기고 숫자를 가린다."""
-    if not phone:
-        return None
-    parts = phone.split("-")
-    if len(parts) == 3:
-        return f"{parts[0]}-{'*' * len(parts[1])}-{parts[2]}"
-    digits = sum(c.isdigit() for c in phone)
-    seen = 0
-    out = []
-    for c in phone:
-        if c.isdigit():
-            seen += 1
-            out.append(c if seen > digits - 4 else "*")
-        else:
-            out.append(c)
-    return "".join(out)
+def nurse_phone_patient_ids(db: Session, user: CurrentUser, patient_ids: list[int]) -> set[int]:
+    """간호사 자기 부서에 (취소 아닌) 예약이 있는 환자 id. 간호사가 아니거나 부서가 없으면 빈 집합."""
+    if user.role != NURSE or user.department_id is None or not patient_ids:
+        return set()
+    R = models.Reservation
+    return set(db.scalars(
+        select(R.patient_id).where(R.patient_id.in_(patient_ids), R.department_id == user.department_id,
+                                   R.status == "BOOKED").distinct()
+    ).all())
 
 
 @api.get("/patients", response_model=schemas.PatientPage)
 def search_patients(
     filters: Annotated[schemas.PatientSearch, Query()],
+    user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """이름 일부 또는 차트번호 앞부분으로 찾는다. 전화번호는 가린다."""
+    """이름 일부 또는 차트번호 앞부분으로 찾는다. 전화번호는 역할별로 공개하거나 가린다 (shared/phone.py)."""
     P = models.Patient
     cond = P.name.contains(filters.q, autoescape=True) | P.chart_no.startswith(filters.q, autoescape=True)
     total = db.scalar(select(func.count()).select_from(P).where(cond))
     rows = db.scalars(
         select(P).where(cond).order_by(P.name, P.id).offset((filters.page - 1) * filters.size).limit(filters.size)
     ).all()
-    items = [schemas.PatientSummary(id=p.id, chart_no=p.chart_no, name=p.name, birth_date=p.birth_date,
-                                    phone_masked=mask_phone(p.phone)) for p in rows]
+    open_ids = nurse_phone_patient_ids(db, user, [p.id for p in rows])
+    items = []
+    for p in rows:
+        visible = can_see_patient_phone(user.role, user.patient_id, p.id, open_ids)
+        items.append(schemas.PatientSummary(id=p.id, chart_no=p.chart_no, name=p.name, birth_date=p.birth_date,
+                                            phone=shown(p.phone, visible),
+                                            phone_is_masked=bool(p.phone) and not visible))
     return {"items": items, "page": filters.page, "size": filters.size, "total": total}
 
 
@@ -402,7 +558,12 @@ def get_patient(
     patient_id: int, request: Request,
     user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db),
 ):
-    """환자 상세 + 최근 예약. NURSE 는 자기 부서 예약만 보인다. 개인정보 조회라 감사 로그를 남긴다."""
+    """환자 상세 + 최근 예약. NURSE 는 자기 부서 예약만 보인다. PATIENT 는 본인만. 개인정보 조회라 감사 로그를 남긴다.
+
+    MANAGER 는 전체 부서의 최근 예약이 보이지만 예약 메모는 비어 있다. 진단·진료 메모는 어느 역할에도 포함하지 않는다.
+    """
+    if user.role == PATIENT and patient_id != user.patient_id:
+        deny(request, user, "patient", patient_id)
     patient = db.get(models.Patient, patient_id)
     if patient is None:
         raise not_found("환자를 찾을 수 없습니다")
@@ -413,8 +574,16 @@ def get_patient(
     recent = db.scalars(stmt.order_by(R.reserved_at.desc(), R.id.desc()).limit(RECENT_RESERVATIONS)).all()
     audit.write_audit(request, "PATIENT_VIEW", audit.SUCCESS, user_id=user.id,
                       target_type="patient", target_id=patient_id)
-    out = schemas.PatientOut.model_validate(patient)
-    return schemas.PatientDetail(**out.model_dump(), recent_reservations=recent)
+    return schemas.PatientDetail(**_patient_out(db, user, patient).model_dump(),
+                                 recent_reservations=[reservation_view(user, r) for r in recent])
+
+
+def _patient_out(db: Session, user: CurrentUser, patient: models.Patient) -> schemas.PatientOut:
+    visible = can_see_patient_phone(user.role, user.patient_id, patient.id,
+                                    nurse_phone_patient_ids(db, user, [patient.id]))
+    return schemas.PatientOut(id=patient.id, chart_no=patient.chart_no, name=patient.name,
+                              birth_date=patient.birth_date, phone=shown(patient.phone, visible),
+                              phone_is_masked=bool(patient.phone) and not visible, created_at=patient.created_at)
 
 
 @api.post("/patients", response_model=schemas.PatientOut, status_code=status.HTTP_201_CREATED)
@@ -436,7 +605,53 @@ def create_patient(
         db.rollback()
         raise conflict("이미 있는 차트번호입니다") from None
     db.refresh(patient)
-    return patient
+    return _patient_out(db, user, patient)
+
+
+# ---------- R18 직원 연락처 ----------
+
+def staff_contacts(db: Session, user: CurrentUser) -> list[schemas.StaffOut]:
+    """역할별로 볼 수 있는 직원 (활성 직원, 환자 계정 제외). 범위는 쿼리에서 거르고, 번호는 shared/phone.py 로 공개.
+
+    MANAGER 전체 직원 / NURSE·DEPT_HEAD 자기 부서 직원 / DOCTOR 자기 부서 부서장만 /
+    DIRECTOR 자기 부서 직원(부서가 있으면) + 모든 부서 부서장 / 그 밖의 역할은 직원 목록 없음.
+    """
+    stmt = select(User).where(User.role != PATIENT, User.is_active.is_(True))
+    if user.role in (NURSE, DOCTOR, DEPT_HEAD):
+        if user.department_id is None:
+            return []
+        stmt = stmt.where(User.department_id == user.department_id)
+        if user.role == DOCTOR:
+            stmt = stmt.where(User.role == DEPT_HEAD)
+    elif user.role == DIRECTOR:
+        cond = User.role == DEPT_HEAD
+        if user.department_id is not None:
+            cond = cond | (User.department_id == user.department_id)
+        stmt = stmt.where(cond)
+    elif user.role != MANAGER:
+        return []
+    out = []
+    for u in db.scalars(stmt.order_by(User.department_id, User.id)).all():
+        visible = can_see_staff_phone(user.role, user.department_id, u.department_id, u.role)
+        out.append(schemas.StaffOut(id=u.id, name=u.name, role=u.role, department_id=u.department_id,
+                                    work_phone=shown(u.work_phone, visible),
+                                    work_phone_is_masked=bool(u.work_phone) and not visible))
+    return out
+
+
+@api.get("/staff", response_model=list[schemas.StaffOut])
+def list_staff(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    """직원 업무용 연락처. 원무과장은 전체 직원, 간호사는 자기 부서 직원만. 번호는 shared/phone.py 규칙으로 공개."""
+    return staff_contacts(db, user)
+
+
+# ---------- R19 연락처 화면 ----------
+
+@api.get("/contacts", response_model=schemas.ContactsOut)
+def get_contacts(user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    """연락처 화면 한 번에: 병원 대표 번호, 진료과 대표 번호, 직원 업무용 연락처 (모두 역할별 공개 범위 적용)."""
+    return schemas.ContactsOut(hospital_phone=config.HOSPITAL_PHONE or None,
+                               departments=department_list(db, user), staff=staff_contacts(db, user))
 
 
 # ---------- 예약 가능 시간 (추가 API) ----------

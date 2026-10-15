@@ -10,6 +10,7 @@ DB 연결 (app_runtime 계정, TLS). 앱과 같은 환경변수를 쓴다:
 
 다시 실행해도 된다. 없는 계정은 새로 만들고, 이미 있는 계정은 비밀번호(password_hash)만 새 값으로 바꾼다.
 (역할·소속·활성 여부·로그인 잠금 상태는 그대로 둔다. 전체가 한 트랜잭션이라 중간에 실패하면 아무것도 바뀌지 않는다.)
+업무용 연락처(work_phone)는 비어 있는 계정에만 채운다 (이미 값이 있으면 그대로).
 
 실행 (PowerShell, 저장소 루트):
   $s = Read-Host "SEED_PASSWORD" -AsSecureString
@@ -45,6 +46,20 @@ TEST_ACCOUNTS = [
     ("dev01",       "개발자",       "DEVELOPER", None,  None),
     ("tester01",    "테스터",       "TESTER",    None,  None),
 ]
+
+
+# 직원 업무용 연락처 (users.work_phone). 실제로 쓰이지 않는 가짜 번호. 환자 계정은 없음(NULL)
+WORK_PHONES = {
+    "nurse_im01": "02-0000-0201",
+    "nurse_os01": "02-0000-0202",
+    "doctor_im01": "02-0000-0203",
+    "office01": "02-0000-0204",
+    "head_im01": "02-0000-0205",
+    "admin01": "02-0000-0206",
+    "director01": "02-0000-0207",
+    "dev01": "02-0000-0208",
+    "tester01": "02-0000-0209",
+}
 
 
 def read_dotenv_value(key: str) -> str:
@@ -117,9 +132,17 @@ def main() -> None:
             ).scalar()
             if user_id is not None:
                 conn.execute(
-                    text("UPDATE users SET password_hash = :password_hash WHERE id = :id"),
-                    {"password_hash": password_hash, "id": user_id},
+                    text("UPDATE users SET password_hash = :password_hash, "
+                         "work_phone = COALESCE(work_phone, :work_phone) WHERE id = :id"),
+                    {"password_hash": password_hash, "work_phone": WORK_PHONES.get(login_id), "id": user_id},
                 )
+                if link and link[0] == "doctor":
+                    # 예전에 연결 없이 만들어진 의사 계정도 연결한다 (이미 다른 계정에 연결된 의사는 건드리지 않는다).
+                    conn.execute(
+                        text("UPDATE doctors SET user_id = :user_id WHERE name = :name AND department_id = "
+                             ":department_id AND (user_id IS NULL OR user_id = :user_id)"),
+                        {"user_id": user_id, "name": link[1], "department_id": department_id},
+                    )
                 print(f"비밀번호 변경: {login_id}")
                 continue
 
@@ -127,11 +150,13 @@ def main() -> None:
             user_id = conn.execute(
                 text(
                     """
-                    INSERT INTO users (login_id, password_hash, name, role, department_id, patient_id, is_active)
-                    VALUES (:login_id, :password_hash, :name, :role, :department_id, :patient_id, TRUE)
+                    INSERT INTO users (login_id, password_hash, name, work_phone, role, department_id, patient_id,
+                                       is_active)
+                    VALUES (:login_id, :password_hash, :name, :work_phone, :role, :department_id, :patient_id, TRUE)
                     """
                 ),
-                {"login_id": login_id, "password_hash": password_hash, "name": name, "role": role,
+                {"login_id": login_id, "password_hash": password_hash, "name": name,
+                 "work_phone": WORK_PHONES.get(login_id), "role": role,
                  "department_id": department_id, "patient_id": patient_id},
             ).lastrowid
 

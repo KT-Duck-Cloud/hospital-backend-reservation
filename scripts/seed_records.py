@@ -1,9 +1,17 @@
 """샘플 진료기록 넣기 (가상 데이터). 진단·소견은 shared/crypto.py 로 AES-256-GCM 암호화해서만 저장한다.
 
-1) patient01 계정에 연결된 환자의 시연 데이터: 지난 접수 완료 예약 2건 + 그 진료기록 2건 + 영수증 2건 + 앞으로의 예약 1건
-   (db/seed.sql 의 이 환자 예약은 모두 취소라서 따로 넣는다. scripts/seed_users.py 를 먼저 실행해야 한다.)
-2) db/seed.sql 의 접수된 예약(CHECKED_IN)마다 진료기록 1건.
+1) patient01 계정에 연결된 환자의 시연 데이터: 지난 진료 완료(COMPLETED) 예약 2건 + 그 진료기록 2건 + 영수증 2건
+   + 앞으로의 예약 1건 (db/seed.sql 의 이 환자 예약은 모두 취소라서 따로 넣는다. scripts/seed_users.py 를 먼저 실행해야 한다.)
+2) db/seed.sql 의 접수된 예약(CHECKED_IN)마다 진료기록 1건을 넣고, 그 예약을 진료완료(COMPLETED)로 바꾼다.
+3) 로그인 계정이 연결된 의사(doctors.user_id, 예: doctor_im01)마다 오늘(KST) 담당 예약 3건: 2건은 접수(CHECKED_IN,
+   대기번호 포함), 1건은 접수 전. 의사 화면에 바로 대기 환자가 보인다. request_id 에 의사·날짜·순번이 들어가서 같은 날
+   다시 실행해도 쌓이지 않고, 다음 날 실행하면 그날 몫이 새로 생긴다 (이 예약은 2번의 진료기록 만들기에서 제외).
 이미 있는 것(같은 request_id 예약, 진료기록·영수증이 이미 있는 예약)은 건너뛴다 (다시 실행해도 쌓이지 않는다).
+
+새 규칙 (db/schema.sql)
+  - 대기번호는 queue_date(KST 날짜)와 함께 저장한다: UNIQUE(department_id, queue_date, queue_no)
+  - 진료기록·영수증의 환자는 항상 그 예약의 환자 (외래키 (reservation_id, patient_id) → reservations (id, patient_id))
+  - 진료기록이 있는 예약은 진료완료(COMPLETED). 예약 1건에 진료기록·영수증은 각각 최대 1건
 
 필요한 값 (화면에 출력하지 않는다)
   - MEDICAL_KEY (base64 32바이트), MEDICAL_KEY_VERSION (기본 1): 환경변수, 없으면 저장소 루트 .env
@@ -36,6 +44,9 @@ DEFAULT_SAMPLE = ("정기 진료", "특이 소견 없음")
 
 # patient01 계정에 연결된 환자의 시연용 데이터 (db/seed.sql 의 이 환자 예약은 모두 취소라 보여 줄 것이 없다).
 # request_id 로 이미 있는지 확인하므로 다시 실행해도 쌓이지 않는다. 날짜는 처음 실행한 날(KST) 기준.
+DOCTOR_DEMO_PREFIX = "demo-doctor-"
+DOCTOR_DEMO_COUNT = 3        # 의사 1명당 오늘 예약 수
+DOCTOR_DEMO_CHECKED_IN = 2   # 그중 접수까지 해 두는 수
 DEMO_LOGIN_ID = "patient01"
 DEMO = [
     # (request_id, 진료과 코드, 오늘 기준 며칠, 초진/재진, 진단, 소견, 영수증 금액)  진단 None = 앞으로의 예약
@@ -68,7 +79,7 @@ def seed_demo_patient(conn, crypto) -> tuple[int, int, int]:
 
     이미 있는 것(같은 request_id 예약, 같은 예약의 진료기록·영수증)은 건너뛴다. 넣은 (예약, 진료기록, 영수증) 수를 돌려준다.
     """
-    from shared.timeutil import kst_day_range_utc, today_kst
+    from shared.timeutil import kst_date_of, kst_day_range_utc, today_kst
 
     found = conn.execute(text("SELECT id, patient_id FROM users WHERE login_id = :l"), {"l": DEMO_LOGIN_ID}).first()
     if found is None or found.patient_id is None:
@@ -87,21 +98,22 @@ def seed_demo_patient(conn, crypto) -> tuple[int, int, int]:
             reserved_at = _free_slot(conn, doctor_id, day_start)
             past = diagnosis is not None
             checked_in_at = reserved_at - timedelta(minutes=10) if past else None
-            queue_no = None
-            if past:  # 그날 그 진료과의 다음 대기번호
+            queue_no = queue_date = None
+            if past:  # 그날(KST) 그 진료과의 다음 대기번호 (UNIQUE(department_id, queue_date, queue_no) 를 지킨다)
+                queue_date = kst_date_of(reserved_at)
                 queue_no = (conn.execute(text(
                     "SELECT COALESCE(MAX(queue_no), 0) FROM reservations WHERE department_id = :d "
-                    "AND reserved_at >= :s AND reserved_at < :e"),
-                    {"d": dept_id, "s": day_start, "e": day_start + timedelta(days=1)}).scalar() + 1)
+                    "AND queue_date = :qd"), {"d": dept_id, "qd": queue_date}).scalar() + 1)
             created = reserved_at - timedelta(days=3)
             conn.execute(text(
-                "INSERT INTO reservations (request_id, patient_id, department_id, doctor_id, queue_no, reserved_at, "
-                "visit_type, status, checkin_status, checked_in_at, memo, created_by, created_at, updated_at) "
-                "VALUES (:r, :p, :d, :doc, :q, :at, :v, 'BOOKED', :ci, :cia, :memo, :u, :c, :c)"),
-                {"r": request_id, "p": patient_id, "d": dept_id, "doc": doctor_id, "q": queue_no, "at": reserved_at,
-                 "v": visit_type,
-                 "ci": "CHECKED_IN" if past else "NOT_CHECKED_IN", "cia": checked_in_at,
-                 "memo": "시연용 예약", "u": user_id, "c": created})
+                "INSERT INTO reservations (request_id, patient_id, department_id, doctor_id, queue_no, queue_date, "
+                "reserved_at, visit_type, status, checkin_status, checked_in_at, memo, created_by, created_at, "
+                "updated_at) "
+                "VALUES (:r, :p, :d, :doc, :q, :qd, :at, :v, 'BOOKED', :ci, :cia, :memo, :u, :c, :c)"),
+                {"r": request_id, "p": patient_id, "d": dept_id, "doc": doctor_id, "q": queue_no, "qd": queue_date,
+                 "at": reserved_at, "v": visit_type,
+                 "ci": "COMPLETED" if past else "NOT_CHECKED_IN",  # 진료기록이 있는 지난 예약 = 진료완료
+                 "cia": checked_in_at, "memo": "시연용 예약", "u": user_id, "c": created})
             reservation = conn.execute(
                 text("SELECT id, checked_in_at FROM reservations WHERE request_id = :r"), {"r": request_id}).one()
             added[0] += 1
@@ -135,6 +147,49 @@ def seed_demo_patient(conn, crypto) -> tuple[int, int, int]:
     return tuple(added)
 
 
+def seed_doctor_demo(conn) -> tuple[int, int]:
+    """로그인 계정이 있는 의사마다 오늘(KST) 담당 예약 DOCTOR_DEMO_COUNT 건 (앞의 DOCTOR_DEMO_CHECKED_IN 건은 접수).
+
+    이미 있는 것(같은 request_id)은 건너뛴다. 넣은 (의사 수, 예약 수)를 돌려준다.
+    """
+    from shared.models import utcnow
+    from shared.timeutil import kst_date_of, kst_day_range_utc, today_kst
+
+    doctors = conn.execute(text(
+        "SELECT doc.id, doc.department_id, doc.user_id FROM doctors doc JOIN users u ON u.id = doc.user_id "
+        "WHERE doc.is_active AND u.is_active ORDER BY doc.id")).all()
+    patients = [r[0] for r in conn.execute(text("SELECT id FROM patients ORDER BY id LIMIT 30"))]
+    if not doctors or not patients:
+        return 0, 0
+    today = today_kst()
+    day_start, _ = kst_day_range_utc(today)
+    added = 0
+    for d_index, (doctor_id, dept_id, user_id) in enumerate(doctors):
+        for n in range(DOCTOR_DEMO_COUNT):
+            request_id = f"{DOCTOR_DEMO_PREFIX}{doctor_id}-{today:%Y%m%d}-{n + 1}"
+            if conn.execute(text("SELECT 1 FROM reservations WHERE request_id = :r"), {"r": request_id}).first():
+                continue
+            reserved_at = _free_slot(conn, doctor_id, day_start)
+            queue_no = queue_date = checked_in_at = None
+            status = "NOT_CHECKED_IN"
+            if n < DOCTOR_DEMO_CHECKED_IN:  # 오늘(KST) 그 진료과의 다음 대기번호 (UNIQUE(department_id, queue_date, queue_no))
+                status, queue_date, checked_in_at = "CHECKED_IN", kst_date_of(reserved_at), utcnow()
+                queue_no = conn.execute(text(
+                    "SELECT COALESCE(MAX(queue_no), 0) + 1 FROM reservations WHERE department_id = :d "
+                    "AND queue_date = :qd"), {"d": dept_id, "qd": queue_date}).scalar()
+            now = utcnow()
+            conn.execute(text(
+                "INSERT INTO reservations (request_id, patient_id, department_id, doctor_id, queue_no, queue_date, "
+                "reserved_at, visit_type, status, checkin_status, checked_in_at, memo, created_by, created_at, "
+                "updated_at) VALUES (:r, :p, :d, :doc, :q, :qd, :at, 'RETURN', 'BOOKED', :ci, :cia, :memo, :u, "
+                ":now, :now)"),
+                {"r": request_id, "p": patients[(d_index * DOCTOR_DEMO_COUNT + n) % len(patients)], "d": dept_id,
+                 "doc": doctor_id, "q": queue_no, "qd": queue_date, "at": reserved_at, "ci": status,
+                 "cia": checked_in_at, "memo": "시연용 예약 (의사 화면)", "u": user_id, "now": now})
+            added += 1
+    return len(doctors), added
+
+
 def main() -> None:
     for name in ("MEDICAL_KEY", "MEDICAL_KEY_VERSION"):
         if not os.environ.get(name):
@@ -161,7 +216,8 @@ def main() -> None:
             FROM reservations r
             JOIN departments d ON d.id = r.department_id
             LEFT JOIN medical_records m ON m.reservation_id = r.id
-            WHERE r.checkin_status = 'CHECKED_IN' AND r.doctor_id IS NOT NULL AND m.id IS NULL
+            WHERE r.checkin_status = 'CHECKED_IN' AND r.status = 'BOOKED' AND r.doctor_id IS NOT NULL
+              AND m.id IS NULL AND r.request_id NOT LIKE 'demo-doctor-%'
             ORDER BY r.id
             """
         )).all()
@@ -184,6 +240,12 @@ def main() -> None:
                  "d_enc": d_enc, "n_enc": n_enc, "d_nonce": d_nonce, "n_nonce": n_nonce, "version": version,
                  "created": created},
             )
+        # 진료기록이 있는 접수 예약은 진료완료로 (진료대기 → 진료완료. 상태는 앞으로만 간다. 다시 실행해도 안전)
+        conn.execute(text(
+            "UPDATE reservations r SET r.checkin_status = 'COMPLETED' WHERE r.checkin_status = 'CHECKED_IN' "
+            "AND EXISTS (SELECT 1 FROM medical_records m WHERE m.reservation_id = r.id)"))
+        doctor_count, doctor_added = seed_doctor_demo(conn)
+    print(f"의사 시연 예약: 계정 연결된 의사 {doctor_count}명, 오늘 예약 {doctor_added}건을 새로 넣었습니다.")
     print(f"{DEMO_LOGIN_ID} 시연 데이터: 예약 {demo[0]}건, 진료기록 {demo[1]}건, 영수증 {demo[2]}건을 새로 넣었습니다.")
     print(f"진료기록 {len(rows)}건을 암호화해서 넣었습니다. (키·평문은 출력하지 않음)")
 
