@@ -23,7 +23,9 @@ def probe(**env):
     full = {k: v for k, v in os.environ.items() if not k.startswith("DB_POOL") and k != "DB_MAX_OVERFLOW"}
     full.pop("DATABASE_URL", None)
     full.update(FAKE_DB, **env)
-    r = subprocess.run([sys.executable, "-c", PROBE], cwd=ROOT, env=full, capture_output=True, text=True)
+    full["PYTHONIOENCODING"] = "utf-8"  # 자식 출력도 UTF-8 로 맞춰, Windows 기본 인코딩(cp949)에서도 같은 방식으로 읽는다
+    r = subprocess.run([sys.executable, "-c", PROBE], cwd=ROOT, env=full, capture_output=True, text=True,
+                       encoding="utf-8")
     return r
 
 
