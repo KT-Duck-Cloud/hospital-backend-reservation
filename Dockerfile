@@ -3,7 +3,7 @@
 #   docker build -t reservation-app-reservation:dev .
 
 # ---- 빌드 단계: requirements.txt로 패키지를 가상환경에 설치 ----
-FROM python:3.12.15-slim AS builder
+FROM python:3.12.15-alpine3.24 AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -16,7 +16,7 @@ RUN pip install -r requirements.txt \
     && pip uninstall -y pip setuptools wheel
 
 # ---- 실행 단계: 설치된 패키지와 앱 코드만 복사 ----
-FROM python:3.12.15-slim
+FROM python:3.12.15-alpine3.24
 
 # 이미지 태그와 같은 Git 커밋 값을 빌드 때 받는다: --build-arg APP_VERSION=<commit>
 ARG APP_VERSION=dev
@@ -28,8 +28,10 @@ ENV APP_VERSION=${APP_VERSION} \
 
 # DB_URL·DB_USERNAME·DB_PASSWORD, READ_ONLY_MODE는 일부러 넣지 않는다. 실행할 때 -e 로 주입한다.
 
-RUN groupadd --system --gid 10001 app \
-    && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
+# OS 보안 업데이트(apk upgrade)를 받고, 셸 로그인이 없는 non-root 사용자(uid 10001)를 만든다.
+RUN apk upgrade --no-cache \
+    && addgroup -S -g 10001 app \
+    && adduser -S -u 10001 -G app -H -h /nonexistent -s /sbin/nologin app
 
 # 실행에 필요 없는 패키지 도구(pip 등)는 제거한다. 앱은 /opt/venv 의 패키지만 쓴다.
 RUN python -m pip uninstall -y pip setuptools wheel || true
