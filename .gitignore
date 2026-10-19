@@ -38,3 +38,6 @@ prompt-step*.md
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 로컬 CI 작업 설명서 (GitHub에서 받아온 원본 docs는 제외하지 않음)
+/docs/CI-설정.md
