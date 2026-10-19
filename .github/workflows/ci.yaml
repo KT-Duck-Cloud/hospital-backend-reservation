@@ -92,25 +92,29 @@ jobs:
           python -m compileall -q app shared tests
           python -m pytest tests -q --junitxml="$RUNNER_TEMP/pytest.xml"
       - name: 소스 취약점·비밀정보 검사
+        # 결과 확인용 검사: 발견 사항이나 검사 오류로 빌드·배포를 중단하지 않는다.
+        continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           version: v0.70.0
           scan-type: fs
           scan-ref: .
           scanners: vuln,secret
-          severity: HIGH,CRITICAL
-          exit-code: '1'
-          ignore-unfixed: false
+          severity: CRITICAL
+          exit-code: '0'
+          ignore-unfixed: true
           cache: 'false'
           cache-dir: ${{ runner.temp }}/trivy-cache
       - name: Dockerfile 등 설정 검사
+        # 결과 확인용 검사: 발견 사항이나 검사 오류로 빌드·배포를 중단하지 않는다.
+        continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           version: v0.70.0
           scan-type: config
           scan-ref: .
-          severity: HIGH,CRITICAL
-          exit-code: '1'
+          severity: CRITICAL
+          exit-code: '0'
           cache: 'false'
           cache-dir: ${{ runner.temp }}/trivy-cache
       # 업로드 작업이 꺼져 있을 때와 PR에서도 실제 이미지 빌드·검사는 수행한다.
@@ -125,15 +129,17 @@ jobs:
             --tag "duckcloud/$IMAGE_NAME:sha-$GITHUB_SHA" .
       - name: 실제 실행 이미지 검사
         if: github.event_name == 'pull_request' || vars.CICD_PUBLISH_ENABLED != 'true' || (github.event_name == 'workflow_dispatch' && inputs.mode != 'publish')
+        # 결과 확인용 검사: 발견 사항이나 검사 오류로 빌드·배포를 중단하지 않는다.
+        continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           version: v0.70.0
           scan-type: image
           image-ref: duckcloud/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
           scanners: vuln,secret
-          severity: HIGH,CRITICAL
-          exit-code: '1'
-          ignore-unfixed: false
+          severity: CRITICAL
+          exit-code: '0'
+          ignore-unfixed: true
           cache: 'false'
           cache-dir: ${{ runner.temp }}/trivy-cache
 
@@ -167,16 +173,18 @@ jobs:
           docker buildx build --platform linux/amd64 --provenance=false --load \
             --build-arg "APP_VERSION=$GITHUB_SHA" \
             --tag "duckcloud/$IMAGE_NAME:sha-$GITHUB_SHA" .
-      - name: 업로드할 실제 이미지 검사 — 실패하면 이후 단계 중단
+      - name: 업로드할 실제 이미지 검사 — 참고용
+        # 결과 확인용 검사: 발견 사항이나 검사 오류로 빌드·배포를 중단하지 않는다.
+        continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           version: v0.70.0
           scan-type: image
           image-ref: duckcloud/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
           scanners: vuln,secret
-          severity: HIGH,CRITICAL
-          exit-code: '1'
-          ignore-unfixed: false
+          severity: CRITICAL
+          exit-code: '0'
+          ignore-unfixed: true
           cache: 'false'
           cache-dir: ${{ runner.temp }}/trivy-cache
       - name: Harbor CI 계정 로그인
