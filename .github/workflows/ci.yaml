@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'check=검사만 / harbor-login=접속만 / publish=검사 후 업로드'
+        description: 'check=검사 / harbor-diagnose=인증 경로 진단 / harbor-login=로그인 / publish=업로드'
         type: choice
-        options: [check, harbor-login, publish]
+        options: [check, harbor-diagnose, harbor-login, publish]
         default: check
 
 permissions:
@@ -34,6 +34,105 @@ env:
   DOCKER_CONFIG: /tmp/duckcloud-docker-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
+  harbor-diagnose:
+    # ci 브랜치에서도 빌드·Push 없이 인증 경로만 검사한다.
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'harbor-diagnose' && (github.ref == 'refs/heads/ci' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Harbor 인증 경로 진단 — 비밀정보 출력 없음
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          # 본문에는 토큰이 포함될 수 있으므로 원문·쿠키·인증 헤더는 출력하지 않는다.
+          set -euo pipefail
+          set +x
+          umask 077
+          DIAG_DIR=$(mktemp -d "$RUNNER_TEMP/harbor-diagnose.XXXXXX")
+          trap 'rm -rf "$DIAG_DIR"' EXIT
+          [[ "$HARBOR_REGISTRY" =~ ^[a-zA-Z0-9.-]+(:[0-9]+)?$ ]]
+          BASE="https://$HARBOR_REGISTRY"
+          echo "진단 시각(UTC): $(date -u +%FT%TZ)"
+          echo "대상: $BASE / 실행 브랜치: $GITHUB_REF_NAME"
+          
+          show_result() {
+            local label="$1" code="$2" prefix="$3"
+            echo "===== $label / HTTP $code ====="
+            # Cloudflare 담당자에게 전달할 요청 ID와 응답 종류만 출력한다.
+            tr -d '\r' < "$prefix.headers" | grep -Ei '^(HTTP/|server:|content-type:|cf-ray:|cf-mitigated:|x-request-id:|docker-distribution-api-version:)' || true
+            if grep -qi '^location:' "$prefix.headers"; then
+              echo 'redirect_present=yes (자동 이동하지 않음)'
+            fi
+            if grep -qi '^set-cookie:' "$prefix.headers"; then
+              echo 'set_cookie_present=yes (쿠키 값 숨김)'
+            fi
+            if jq -e 'type == "object"' "$prefix.body" >/dev/null 2>&1; then
+              echo 'body_type=JSON'
+              if jq -e '.errors[]? | select(.code == "UNAUTHORIZED")' "$prefix.body" >/dev/null 2>&1; then
+                echo 'registry_error=UNAUTHORIZED'
+              elif jq -e '.errors[]? | select(.code == "DENIED")' "$prefix.body" >/dev/null 2>&1; then
+                echo 'registry_error=DENIED'
+              fi
+            elif grep -Eqi '<!doctype html|<html' "$prefix.body"; then
+              echo 'body_type=HTML'
+            else
+              echo 'body_type=empty_or_other'
+            fi
+            if grep -Eqi 'cloudflare|cf-chl|challenge-platform|access denied' "$prefix.body"; then
+              echo 'body_has_cloudflare_or_block_page_marker=yes (차단 주체 확정은 로그 확인 필요)'
+            fi
+          }
+          
+          request() {
+            local label="$1" prefix="$2" url="$3"
+            shift 3
+            local code
+            # 리다이렉트를 따라가며 다른 주소로 자격 증명을 보내지 않는다.
+            if code=$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+              --dump-header "$prefix.headers" --output "$prefix.body" \
+              --write-out '%{http_code}' "$@" "$url"); then
+              show_result "$label" "$code" "$prefix"
+            else
+              echo "===== $label / 네트워크 또는 TLS 연결 실패 ====="
+              return 1
+            fi
+          }
+          
+          request 'Registry 인증 전' "$DIAG_DIR/registry" "$BASE/v2/" || exit 0
+          REALM=$(tr -d '\r' < "$DIAG_DIR/registry.headers" | sed -n 's/^[Ww][Ww][Ww]-[Aa]uthenticate:.*realm="\([^"]*\)".*/\1/p' | tail -n 1)
+          if [[ "$REALM" != "$BASE/service/token" ]]; then
+            echo 'token_realm_matches_expected=no / 인증 정보를 전송하지 않고 중단'
+            exit 0
+          fi
+          echo 'token_realm_matches_expected=yes / 외부 HTTPS 도메인의 /service/token'
+          if [[ -z "$HARBOR_USERNAME" || -z "$HARBOR_PASSWORD" ]]; then
+            echo 'credentials_present=no / GitHub Secrets 확인 필요'
+            exit 0
+          fi
+          if [[ "$HARBOR_USERNAME" != 'robot$'* ]]; then
+            echo 'robot_username_format=no / CI Robot 계정 이름 확인 필요'
+            exit 0
+          fi
+          echo 'credentials_present=yes / robot_username_format=yes (실제 값은 숨김)'
+          
+          # 인증 정보는 권한 600인 임시 파일에만 넣고 실행 종료 시 삭제한다.
+          BASIC_AUTH=$(printf '%s:%s' "$HARBOR_USERNAME" "$HARBOR_PASSWORD" | base64 | tr -d '\r\n')
+          printf 'header = "Authorization: Basic %s"\n' "$BASIC_AUTH" > "$DIAG_DIR/basic.conf"
+          unset BASIC_AUTH
+          request '로봇 계정 토큰 발급' "$DIAG_DIR/token" \
+            "$BASE/service/token?service=harbor-registry" --config "$DIAG_DIR/basic.conf" || exit 0
+          if ! ACCESS_TOKEN=$(jq -er '(.token // .access_token) | select(type == "string" and length > 0)' "$DIAG_DIR/token.body" 2>/dev/null); then
+            echo 'token_issued=no / 위 상태 코드와 CF-Ray·X-Request-ID로 차단 로그 대조'
+            exit 0
+          fi
+          echo 'token_issued=yes (토큰 값 숨김)'
+          printf 'header = "Authorization: Bearer %s"\n' "$ACCESS_TOKEN" > "$DIAG_DIR/bearer.conf"
+          unset ACCESS_TOKEN
+          request '발급된 토큰으로 Registry 접근' "$DIAG_DIR/verified" \
+            "$BASE/v2/" --config "$DIAG_DIR/bearer.conf" || exit 0
+          echo '진단 종료: 이미지 업로드·배포는 실행하지 않았습니다. curl 진단이며 Docker 요청과 차이가 있을 수 있습니다.'
+
   harbor-login:
     # VM에서 성공한 접속과 GitHub Runner에서의 접속은 별도다. 첫 실행은 이 모드로 한다.
     if: github.event_name == 'workflow_dispatch' && inputs.mode == 'harbor-login' && github.ref == 'refs/heads/main'
@@ -70,7 +169,7 @@ jobs:
         run: docker logout "$HARBOR_REGISTRY" || true
 
   check:
-    if: github.event_name != 'workflow_dispatch' || inputs.mode != 'harbor-login'
+    if: github.event_name != 'workflow_dispatch' || (inputs.mode != 'harbor-login' && inputs.mode != 'harbor-diagnose')
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -126,7 +225,8 @@ jobs:
         run: |
           docker buildx build --platform linux/amd64 --provenance=false --load \
             --build-arg "APP_VERSION=$GITHUB_SHA" \
-            --tag "duckcloud/$IMAGE_NAME:sha-$GITHUB_SHA" .
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "duckcloud/$IMAGE_NAME:latest" .
       - name: 실제 실행 이미지 검사
         if: github.event_name == 'pull_request' || vars.CICD_PUBLISH_ENABLED != 'true' || (github.event_name == 'workflow_dispatch' && inputs.mode != 'publish')
         # 결과 확인용 검사: 발견 사항이나 검사 오류로 빌드·배포를 중단하지 않는다.
@@ -135,7 +235,7 @@ jobs:
         with:
           version: v0.70.0
           scan-type: image
-          image-ref: duckcloud/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          image-ref: duckcloud/${{ env.IMAGE_NAME }}:latest
           scanners: vuln,secret
           severity: CRITICAL
           exit-code: '0'
@@ -150,8 +250,6 @@ jobs:
     timeout-minutes: 40
     permissions:
       contents: read
-    outputs:
-      harbor-digest: ${{ steps.harbor.outputs.harbor-digest }}
     steps:
       - name: 검사한 커밋의 앱 소스 가져오기
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -172,7 +270,8 @@ jobs:
         run: |
           docker buildx build --platform linux/amd64 --provenance=false --load \
             --build-arg "APP_VERSION=$GITHUB_SHA" \
-            --tag "duckcloud/$IMAGE_NAME:sha-$GITHUB_SHA" .
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "duckcloud/$IMAGE_NAME:latest" .
       - name: 업로드할 실제 이미지 검사 — 참고용
         # 결과 확인용 검사: 발견 사항이나 검사 오류로 빌드·배포를 중단하지 않는다.
         continue-on-error: true
@@ -180,13 +279,105 @@ jobs:
         with:
           version: v0.70.0
           scan-type: image
-          image-ref: duckcloud/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          image-ref: duckcloud/${{ env.IMAGE_NAME }}:latest
           scanners: vuln,secret
           severity: CRITICAL
           exit-code: '0'
           ignore-unfixed: true
           cache: 'false'
           cache-dir: ${{ runner.temp }}/trivy-cache
+      - name: Harbor 인증 경로 진단 — 비밀정보 출력 없음
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          # 본문에는 토큰이 포함될 수 있으므로 원문·쿠키·인증 헤더는 출력하지 않는다.
+          set -euo pipefail
+          set +x
+          umask 077
+          DIAG_DIR=$(mktemp -d "$RUNNER_TEMP/harbor-diagnose.XXXXXX")
+          trap 'rm -rf "$DIAG_DIR"' EXIT
+          [[ "$HARBOR_REGISTRY" =~ ^[a-zA-Z0-9.-]+(:[0-9]+)?$ ]]
+          BASE="https://$HARBOR_REGISTRY"
+          echo "진단 시각(UTC): $(date -u +%FT%TZ)"
+          echo "대상: $BASE / 실행 브랜치: $GITHUB_REF_NAME"
+          
+          show_result() {
+            local label="$1" code="$2" prefix="$3"
+            echo "===== $label / HTTP $code ====="
+            # Cloudflare 담당자에게 전달할 요청 ID와 응답 종류만 출력한다.
+            tr -d '\r' < "$prefix.headers" | grep -Ei '^(HTTP/|server:|content-type:|cf-ray:|cf-mitigated:|x-request-id:|docker-distribution-api-version:)' || true
+            if grep -qi '^location:' "$prefix.headers"; then
+              echo 'redirect_present=yes (자동 이동하지 않음)'
+            fi
+            if grep -qi '^set-cookie:' "$prefix.headers"; then
+              echo 'set_cookie_present=yes (쿠키 값 숨김)'
+            fi
+            if jq -e 'type == "object"' "$prefix.body" >/dev/null 2>&1; then
+              echo 'body_type=JSON'
+              if jq -e '.errors[]? | select(.code == "UNAUTHORIZED")' "$prefix.body" >/dev/null 2>&1; then
+                echo 'registry_error=UNAUTHORIZED'
+              elif jq -e '.errors[]? | select(.code == "DENIED")' "$prefix.body" >/dev/null 2>&1; then
+                echo 'registry_error=DENIED'
+              fi
+            elif grep -Eqi '<!doctype html|<html' "$prefix.body"; then
+              echo 'body_type=HTML'
+            else
+              echo 'body_type=empty_or_other'
+            fi
+            if grep -Eqi 'cloudflare|cf-chl|challenge-platform|access denied' "$prefix.body"; then
+              echo 'body_has_cloudflare_or_block_page_marker=yes (차단 주체 확정은 로그 확인 필요)'
+            fi
+          }
+          
+          request() {
+            local label="$1" prefix="$2" url="$3"
+            shift 3
+            local code
+            # 리다이렉트를 따라가며 다른 주소로 자격 증명을 보내지 않는다.
+            if code=$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+              --dump-header "$prefix.headers" --output "$prefix.body" \
+              --write-out '%{http_code}' "$@" "$url"); then
+              show_result "$label" "$code" "$prefix"
+            else
+              echo "===== $label / 네트워크 또는 TLS 연결 실패 ====="
+              return 1
+            fi
+          }
+          
+          request 'Registry 인증 전' "$DIAG_DIR/registry" "$BASE/v2/" || exit 0
+          REALM=$(tr -d '\r' < "$DIAG_DIR/registry.headers" | sed -n 's/^[Ww][Ww][Ww]-[Aa]uthenticate:.*realm="\([^"]*\)".*/\1/p' | tail -n 1)
+          if [[ "$REALM" != "$BASE/service/token" ]]; then
+            echo 'token_realm_matches_expected=no / 인증 정보를 전송하지 않고 중단'
+            exit 0
+          fi
+          echo 'token_realm_matches_expected=yes / 외부 HTTPS 도메인의 /service/token'
+          if [[ -z "$HARBOR_USERNAME" || -z "$HARBOR_PASSWORD" ]]; then
+            echo 'credentials_present=no / GitHub Secrets 확인 필요'
+            exit 0
+          fi
+          if [[ "$HARBOR_USERNAME" != 'robot$'* ]]; then
+            echo 'robot_username_format=no / CI Robot 계정 이름 확인 필요'
+            exit 0
+          fi
+          echo 'credentials_present=yes / robot_username_format=yes (실제 값은 숨김)'
+          
+          # 인증 정보는 권한 600인 임시 파일에만 넣고 실행 종료 시 삭제한다.
+          BASIC_AUTH=$(printf '%s:%s' "$HARBOR_USERNAME" "$HARBOR_PASSWORD" | base64 | tr -d '\r\n')
+          printf 'header = "Authorization: Basic %s"\n' "$BASIC_AUTH" > "$DIAG_DIR/basic.conf"
+          unset BASIC_AUTH
+          request '로봇 계정 토큰 발급' "$DIAG_DIR/token" \
+            "$BASE/service/token?service=harbor-registry" --config "$DIAG_DIR/basic.conf" || exit 0
+          if ! ACCESS_TOKEN=$(jq -er '(.token // .access_token) | select(type == "string" and length > 0)' "$DIAG_DIR/token.body" 2>/dev/null); then
+            echo 'token_issued=no / 위 상태 코드와 CF-Ray·X-Request-ID로 차단 로그 대조'
+            exit 0
+          fi
+          echo 'token_issued=yes (토큰 값 숨김)'
+          printf 'header = "Authorization: Bearer %s"\n' "$ACCESS_TOKEN" > "$DIAG_DIR/bearer.conf"
+          unset ACCESS_TOKEN
+          request '발급된 토큰으로 Registry 접근' "$DIAG_DIR/verified" \
+            "$BASE/v2/" --config "$DIAG_DIR/bearer.conf" || exit 0
+          echo '진단 종료: 이미지 업로드·배포는 실행하지 않았습니다. curl 진단이며 Docker 요청과 차이가 있을 수 있습니다.'
       - name: Harbor CI 계정 로그인
         env:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
@@ -194,112 +385,30 @@ jobs:
         run: |
           install -d -m 700 "$DOCKER_CONFIG"
           printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" --username "$HARBOR_USERNAME" --password-stdin
-      - name: 검사한 이미지 Harbor 업로드 및 digest 확인
-        id: harbor
+      - name: Harbor latest 태그 업로드
+        env:
+          SOURCE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          LOCAL="duckcloud/$IMAGE_NAME:sha-$GITHUB_SHA"
-          TARGET="$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME:sha-$GITHUB_SHA"
-          # 업로드한 이미지 내용을 비교한다. 인증 오류를 이미지 없음으로 처리하지 않는다.
-          docker image inspect "$LOCAL" > "$RUNNER_TEMP/local-image.json"
-          CONFIG=$(jq -er '.[0] | select(.Os == "linux" and .Architecture == "amd64") | if .Descriptor then .Descriptor.annotations["config.digest"] else .Id end | select(type == "string")' "$RUNNER_TEMP/local-image.json")
-          [[ "$CONFIG" =~ ^sha256:[0-9a-f]{64}$ ]]
-          REMOTE="$RUNNER_TEMP/remote-manifest.json"
-          if docker manifest inspect --verbose "$TARGET" > "$REMOTE" 2> "$RUNNER_TEMP/manifest-error"; then
-            echo '기존 커밋 태그의 이미지 내용을 확인합니다.'
-          elif grep -Eqi 'manifest unknown|manifest_unknown|no such manifest' "$RUNNER_TEMP/manifest-error"; then
-            docker tag "$LOCAL" "$TARGET"
-            docker push "$TARGET"
-            docker manifest inspect --verbose "$TARGET" > "$REMOTE"
-          else
-            echo '::error::Harbor 이미지 조회 실패. 연결·인증·권한을 확인하세요.'
-            exit 1
+          # 느린 이전 실행이나 과거 커밋 재실행이 latest를 예전 코드로 바꾸지 않도록 확인한다.
+          CURRENT_MAIN=$(curl --fail --silent --show-error \
+            --connect-timeout 5 --max-time 20 \
+            -H "Authorization: Bearer $SOURCE_GITHUB_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            | jq -er '.object.sha')
+          if [[ "$CURRENT_MAIN" != "$GITHUB_SHA" ]]; then
+            echo '더 새로운 main이 있어 이번 latest 업로드를 건너뜁니다.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-          REMOTE_CONFIG=$(jq -er '(.SchemaV2Manifest // .OCIManifest).config.digest' "$REMOTE")
-          [[ "$REMOTE_CONFIG" == "$CONFIG" ]] || { echo '::error::검사한 이미지와 Harbor 이미지가 다릅니다.'; exit 1; }
-          DIGEST=$(jq -er '.Descriptor.digest' "$REMOTE")
-          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          echo "harbor-digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "Harbor 이미지 확인 완료: $TARGET@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          LOCAL="duckcloud/$IMAGE_NAME:latest"
+          TARGET="$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME:latest"
+          # latest는 최신 main 이미지로 갱신하는 태그다. 기존 태그 유무와 관계없이 push한다.
+          docker tag "$LOCAL" "$TARGET"
+          docker push "$TARGET"
+          echo "Harbor 업로드 완료: $TARGET" >> "$GITHUB_STEP_SUMMARY"
+          echo "원본 커밋: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
       - name: Registry 로그인 해제
         if: always()
         run: |
           docker logout "$HARBOR_REGISTRY" || true
-
-  update-gitops:
-    needs: publish
-    if: vars.CICD_GITOPS_UPDATE_ENABLED == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - name: GitOps 저장소 전용 쓰기 토큰 발급
-        id: gitops-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
-        with:
-          app-id: ${{ vars.GITOPS_APP_ID }}
-          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: hospital-gitops
-      - name: 배포 설정 가져오기
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: ${{ github.repository_owner }}/hospital-gitops
-          ref: main
-          token: ${{ steps.gitops-token.outputs.token }}
-      - name: 검증된 이미지 버전만 GitOps에 반영
-        env:
-          SOURCE_GITHUB_TOKEN: ${{ github.token }}
-          # 노드의 VPN 다운로드 주소. CI 업로드 도메인과 구분한다. HTTP 선택은 노드 containerd 설정에서 한다.
-          HARBOR_PULL_REGISTRY: ${{ vars.HARBOR_PULL_REGISTRY || '100.64.0.41:8086' }}
-          HARBOR_DIGEST: ${{ needs.publish.outputs.harbor-digest }}
-        run: |
-          set -euo pipefail
-          # 이 작업은 이미지 파일만 수정한다. DB·운영 멤버·Argo API는 변경하지 않는다.
-          case "$SERVICE" in auth|reservation|stats|web) ;; *) exit 1 ;; esac
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$HARBOR_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$HARBOR_PULL_REGISTRY" =~ ^[a-zA-Z0-9.-]+(:[0-9]+)?$ ]]
-          [[ "$HARBOR_PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]]
-          # 오래 걸린 이전 CI가 최신 main의 이미지 버전을 되돌리지 않게 확인한다.
-          source_is_current() {
-            local latest
-            latest=$(curl --fail --silent --show-error --max-time 20 \
-              -H "Authorization: Bearer $SOURCE_GITHUB_TOKEN" \
-              -H 'Accept: application/vnd.github+json' \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/git/ref/heads/main" | jq -er '.object.sha') || return 2
-            [[ "$latest" == "$GITHUB_SHA" ]]
-          }
-          if source_is_current; then :; else
-            status=$?
-            if [[ "$status" == 1 ]]; then echo '더 새 main이 있어 갱신을 건너뜁니다.'; exit 0; fi
-            exit "$status"
-          fi
-          FILE="releases/harbor/$SERVICE.yaml"
-          test ! -L "$FILE"
-          mkdir -p releases/harbor
-          # JSON은 유효한 YAML 형식이다. 별도 편집 도구 설치 없이 jq로 값을 안전하게 기록한다.
-          jq -n --arg service "$SERVICE" \
-            --arg repository "$HARBOR_PULL_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME" \
-            --arg tag "sha-$GITHUB_SHA@$HARBOR_DIGEST" \
-            '{services:{($service):{image:{repository:$repository,tag:$tag}}}}' > "$FILE"
-          git config user.name duckcloud-ci
-          git config user.email duckcloud-ci@users.noreply.github.com
-          git add -- "$FILE"
-          if git diff --cached --quiet; then echo '이미 같은 버전입니다.'; exit 0; fi
-          git commit -m "chore(images): $SERVICE sha-$GITHUB_SHA"
-          # 다른 서비스가 먼저 수정했으면 받아서 재시도한다. 강제 push는 하지 않는다.
-          for attempt in 1 2 3; do
-            if source_is_current; then :; else
-              status=$?
-              if [[ "$status" == 1 ]]; then echo '더 새 main이 있어 push하지 않습니다.'; exit 0; fi
-              exit "$status"
-            fi
-            if git push origin HEAD:main; then exit 0; fi
-            git fetch origin main
-            git rebase origin/main
-            sleep "$attempt"
-          done
-          echo '::error::GitOps push 실패. 브랜치 정책과 충돌을 확인하세요.'
-          exit 1
